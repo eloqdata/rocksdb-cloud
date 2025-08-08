@@ -2399,9 +2399,9 @@ IOStatus CloudFileSystemImpl::BackupCloudManifest(const std::string& dest_folder
   std::string dest_path = "/" + dest_folder;
 
   // Copy CLOUDMANIFEST to the backup location
-  std::string cloud_manifest_src = 
+  std::string cloud_manifest_src =
       MakeCloudManifestFile(src_path, cloud_fs_options.new_cookie_on_open);
-  std::string cloud_manifest_dest = 
+  std::string cloud_manifest_dest =
       MakeCloudManifestFile(dest_path, cloud_fs_options.new_cookie_on_open);
 
   Log(InfoLogLevel::INFO_LEVEL, info_log_,

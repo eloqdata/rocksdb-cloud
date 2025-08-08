@@ -19,12 +19,13 @@
 namespace ROCKSDB_NAMESPACE {
 
 LocalManifestReader::LocalManifestReader(std::shared_ptr<Logger> info_log,
-                                         CloudFileSystem* cfs)
+                                         CloudFileSystem *cfs)
     : info_log_(std::move(info_log)), cfs_(cfs) {}
 
-IOStatus LocalManifestReader::GetLiveFilesLocally(
-    const std::string& local_dbname, std::set<uint64_t>* list) const {
-  auto* cfs_impl = dynamic_cast<CloudFileSystemImpl*>(cfs_);
+IOStatus
+LocalManifestReader::GetLiveFilesLocally(const std::string &local_dbname,
+                                         std::set<uint64_t> *list) const {
+  auto *cfs_impl = dynamic_cast<CloudFileSystemImpl *>(cfs_);
   assert(cfs_impl);
   // cloud manifest should be set in CloudFileSystem, and it should map to local
   // CloudManifest
@@ -54,9 +55,10 @@ IOStatus LocalManifestReader::GetLiveFilesLocally(
   return GetLiveFilesFromFileReader(std::move(manifest_file_reader), list);
 }
 
-IOStatus LocalManifestReader::GetManifestLiveFiles(
-    const std::string& manifest_file, std::set<uint64_t>* list) const {
-  auto* cfs_impl = dynamic_cast<CloudFileSystemImpl*>(cfs_);
+IOStatus
+LocalManifestReader::GetManifestLiveFiles(const std::string &manifest_file,
+                                          std::set<uint64_t> *list) const {
+  auto *cfs_impl = dynamic_cast<CloudFileSystemImpl *>(cfs_);
   assert(cfs_impl);
 
   std::unique_ptr<SequentialFileReader> manifest_file_reader;
@@ -77,7 +79,7 @@ IOStatus LocalManifestReader::GetManifestLiveFiles(
 
 IOStatus LocalManifestReader::GetLiveFilesFromFileReader(
     std::unique_ptr<SequentialFileReader> file_reader,
-    std::set<uint64_t>* list) const {
+    std::set<uint64_t> *list) const {
   Status s;
   // create a callback that gets invoked whil looping through the log records
   VersionSet::LogReporter reporter;
@@ -89,8 +91,8 @@ IOStatus LocalManifestReader::GetLiveFilesFromFileReader(
   std::string scratch;
 
   // keep track of each CF's live files on each level
-  std::unordered_map<uint32_t,                // CF id
-                     std::unordered_map<int,  // level
+  std::unordered_map<uint32_t,               // CF id
+                     std::unordered_map<int, // level
                                         std::unordered_set<uint64_t>>>
       cf_live_files;
 
@@ -103,13 +105,13 @@ IOStatus LocalManifestReader::GetLiveFilesFromFileReader(
 
     // add the files that are added by this transaction
     std::vector<std::pair<int, FileMetaData>> new_files = edit.GetNewFiles();
-    for (auto& one : new_files) {
+    for (auto &one : new_files) {
       uint64_t num = one.second.fd.GetNumber();
       cf_live_files[edit.GetColumnFamily()][one.first].insert(num);
     }
     // delete the files that are removed by this transaction
     std::set<std::pair<int, uint64_t>> deleted_files = edit.GetDeletedFiles();
-    for (auto& one : deleted_files) {
+    for (auto &one : deleted_files) {
       int level = one.first;
       uint64_t num = one.second;
       // Deleted files should belong to some CF
@@ -130,8 +132,8 @@ IOStatus LocalManifestReader::GetLiveFilesFromFileReader(
     }
   }
 
-  for (auto& [cf_id, live_files] : cf_live_files) {
-    for (auto& [level, level_live_files] : live_files) {
+  for (auto &[cf_id, live_files] : cf_live_files) {
+    for (auto &[level, level_live_files] : live_files) {
       (void)cf_id;
       (void)level;
       list->insert(level_live_files.begin(), level_live_files.end());
@@ -143,8 +145,8 @@ IOStatus LocalManifestReader::GetLiveFilesFromFileReader(
 }
 
 ManifestReader::ManifestReader(std::shared_ptr<Logger> info_log,
-                               CloudFileSystem* cfs,
-                               const std::string& bucket_prefix)
+                               CloudFileSystem *cfs,
+                               const std::string &bucket_prefix)
     : LocalManifestReader(std::move(info_log), cfs),
       bucket_prefix_(bucket_prefix) {}
 
@@ -152,15 +154,15 @@ ManifestReader::ManifestReader(std::shared_ptr<Logger> info_log,
 // Extract all the live files needed by this MANIFEST file and corresponding
 // cloud_manifest object
 //
-IOStatus ManifestReader::GetLiveFiles(const std::string& bucket_path,
-                                      std::set<uint64_t>* list) const {
+IOStatus ManifestReader::GetLiveFiles(const std::string &bucket_path,
+                                      std::set<uint64_t> *list) const {
   IOStatus s;
   std::unique_ptr<CloudManifest> cloud_manifest;
   const FileOptions file_opts;
-  IODebugContext* dbg = nullptr;
+  IODebugContext *dbg = nullptr;
   {
     std::unique_ptr<FSSequentialFile> file;
-    auto cfs_impl = dynamic_cast<CloudFileSystemImpl*>(cfs_);
+    auto cfs_impl = dynamic_cast<CloudFileSystemImpl *>(cfs_);
     assert(cfs_impl);
     auto cloudManifestFile = MakeCloudManifestFile(
         bucket_path, cfs_impl->GetCloudFileSystemOptions().cookie_on_open);
@@ -193,14 +195,38 @@ IOStatus ManifestReader::GetLiveFiles(const std::string& bucket_path,
   return GetLiveFilesFromFileReader(std::move(file_reader), list);
 }
 
-IOStatus ManifestReader::GetMaxFileNumberFromManifest(FileSystem* fs,
-                                                      const std::string& fname,
-                                                      uint64_t* maxFileNumber) {
+IOStatus ManifestReader::GetLiveFiles(const std::string &bucket_path,
+                                      const std::string &epoch,
+                                      std::set<uint64_t> *list) const {
+  auto manifestFile = ManifestFileWithEpoch(bucket_path, epoch);
+
+  IOStatus s;
+  std::unique_ptr<CloudManifest> cloud_manifest;
+  const FileOptions file_opts;
+  IODebugContext *dbg = nullptr;
+
+  std::unique_ptr<SequentialFileReader> file_reader;
+  {
+    std::unique_ptr<FSSequentialFile> file;
+    s = cfs_->NewSequentialFileCloud(bucket_prefix_, manifestFile, file_opts,
+                                     &file, dbg);
+    if (!s.ok()) {
+      return s;
+    }
+    file_reader.reset(new SequentialFileReader(std::move(file), manifestFile));
+  }
+
+  return GetLiveFilesFromFileReader(std::move(file_reader), list);
+}
+
+IOStatus ManifestReader::GetMaxFileNumberFromManifest(FileSystem *fs,
+                                                      const std::string &fname,
+                                                      uint64_t *maxFileNumber) {
   // We check if the file exists to return IsNotFound() error status if it does
   // (NewSequentialFile) doesn't have the same behavior on file not existing --
   // it returns IOError instead.
   const IOOptions io_opts;
-  IODebugContext* dbg = nullptr;
+  IODebugContext *dbg = nullptr;
   auto s = fs->FileExists(fname, io_opts, dbg);
   if (!s.ok()) {
     return s;
@@ -238,5 +264,5 @@ IOStatus ManifestReader::GetMaxFileNumberFromManifest(FileSystem* fs,
   }
   return s;
 }
-}  // namespace ROCKSDB_NAMESPACE
+} // namespace ROCKSDB_NAMESPACE
 #endif /* ROCKSDB_LITE */

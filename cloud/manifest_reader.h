@@ -64,6 +64,10 @@ class ManifestReader : public LocalManifestReader {
   IOStatus GetLiveFiles(const std::string& bucket_path,
                         std::set<uint64_t>* list) const;
 
+  IOStatus GetLiveFiles(const std::string& bucket_path,
+                        const std::string& epoch,
+                        std::set<uint64_t>* list) const;
+
   static IOStatus GetMaxFileNumberFromManifest(FileSystem* fs,
                                                const std::string& fname,
                                                uint64_t* maxFileNumber);
