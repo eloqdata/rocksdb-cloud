@@ -661,7 +661,10 @@ Status CloudFileSystemEnv::NewAwsFileSystem(
     cloud->info_log_ = logger;
 
     // start the purge thread only if there is a destination bucket
-    if (options.dest_bucket.IsValid() && options.run_purger) {
+    // and the purger is enabled and not already running
+    if (options.dest_bucket.IsValid() &&
+        options.run_purger &&
+        !cloud->purge_thread_.joinable()) {
       cloud->purge_thread_ = std::thread([cloud] { cloud->Purger(); });
     }
   }

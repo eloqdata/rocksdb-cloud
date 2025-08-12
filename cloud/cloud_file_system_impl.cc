@@ -2286,7 +2286,10 @@ Status CloudFileSystemImpl::PrepareOptions(const ConfigOptions& options) {
     return status;
   }
   // start the purge thread only if there is a destination bucket
-  if (cloud_fs_options.dest_bucket.IsValid() && cloud_fs_options.run_purger) {
+  // and run_purger is true and purge_thread_ is not already running
+  if (cloud_fs_options.dest_bucket.IsValid() &&
+      cloud_fs_options.run_purger &&
+      !purge_thread_.joinable()) {
     CloudFileSystemImpl* cloud = this;
     purge_thread_ = std::thread([cloud] { cloud->Purger(); });
   }

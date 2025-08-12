@@ -3,6 +3,7 @@
 #pragma once
 
 #include <unordered_map>
+#include <vector>
 
 #include "rocksdb/configurable.h"
 #include "rocksdb/file_system.h"
@@ -76,13 +77,20 @@ class CloudStorageProvider : public Configurable {
                                     const std::string& object_path,
                                     std::vector<std::string>* path_names) = 0;
 
+  // Does the specified object exist in the cloud storage
+  // returns all the objects with meta information that
+  // have the specified path prefix and are stored in a cloud bucket
+  virtual IOStatus ListCloudObjects(const std::string& bucket_name,
+                                    const std::string& object_path,
+                                    std::vector<std::pair<std::string,
+                                    CloudObjectInformation>>* path_names) = 0;
 
   // Does the specified object exist in the cloud storage
   // List all the objects in the specified bucket with the
   // specified path and prefix are stored in a cloud bucket
   virtual IOStatus ListCloudObjectsWithPrefix(const std::string& bucket_name,
                                     const std::string& object_path,
-				    const std::string& object_prefix,
+                                    const std::string& object_prefix,
                                     std::vector<std::string>* path_names) = 0;
 
   // Does the specified object exist in the cloud storage
