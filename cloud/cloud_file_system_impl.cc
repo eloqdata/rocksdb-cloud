@@ -913,8 +913,9 @@ IOStatus CloudFileSystemImpl::LoadLocalCloudManifest(
                                                cookie, &cloud_manifest_);
 }
 
-std::string RemapFilenameWithCloudManifest(const std::string& logical_path,
-                                           CloudManifest* cloud_manifest) {
+std::string CloudFileSystemImpl::RemapFilenameWithCloudManifest(
+                                 const std::string& logical_path,
+                                 CloudManifest* cloud_manifest) const {
   auto file_name = basename(logical_path);
   uint64_t fileNumber;
   FileType type;
