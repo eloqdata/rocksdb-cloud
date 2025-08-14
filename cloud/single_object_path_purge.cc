@@ -78,14 +78,6 @@ static IOStatus ListAllFiles(CloudFileSystemImpl &cfs,
         "[pg] Failed to list files in destination object path %s: %s",
         dest_object_path.c_str(), s.ToString().c_str());
   }
-  // Print file list if log level is debug
-  if (Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_)) {
-    Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
-        "[pg] All files in destination object path %s:", dest_object_path.c_str());
-    for (const auto &file : *all_files) {
-      Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_, "  %s", file.first.c_str());
-    }
-  }
 
   return s;
 }
@@ -188,7 +180,7 @@ static IOStatus CollectLiveFiles(CloudFileSystemImpl &cfs,
       continue;
     }
 
-    Log(InfoLogLevel::INFO_LEVEL, cfs.info_log_,
+    Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
         "[pg] Current epoch Manifest file %s of CloudManifest %s has size %lu "
         "and content hash %s and timestamp %lu",
         manifest_file.c_str(), cloud_manifest_name.c_str(),
@@ -212,7 +204,7 @@ static IOStatus CollectLiveFiles(CloudFileSystemImpl &cfs,
       file_name =
           cfs.RemapFilenameWithCloudManifest(file_name, cloud_manifest_ptr);
       live_files->insert(file_name);
-      Log(InfoLogLevel::INFO_LEVEL, cfs.info_log_,
+      Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
           "[pg] Live file %s found in cloud manifest %s", file_name.c_str(),
           cloud_manifest_name.c_str());
     }
@@ -226,7 +218,7 @@ static void SelectObsoleteFiles(
     const PurgerEpochManifestMap &epoch_manifest_infos,
     std::vector<std::string> *obsolete_files) {
   for (const auto &candidate : all_files) {
-    Log(InfoLogLevel::INFO_LEVEL, cfs.info_log_,
+    Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
         "[pg] Checking candidate file %s", candidate.first.c_str());
     const std::string &candidate_file_path = candidate.first;
     const std::string candidate_file_epoch = GetEpoch(candidate_file_path);
@@ -252,11 +244,11 @@ static void SelectObsoleteFiles(
 
     if (candidate_modification_time < manifest_modification_time) {
       obsolete_files->push_back(candidate_file_path);
-      Log(InfoLogLevel::INFO_LEVEL, cfs.info_log_,
+      Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
           "[pg] Candidate file %s is obsolete and will be deleted",
           candidate_file_path.c_str());
     } else {
-      Log(InfoLogLevel::INFO_LEVEL, cfs.info_log_,
+      Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
           "[pg] Candidate file %s is not obsolete because its modification "
           "time %lu is later than the current epoch manifest file's "
           "modification time %lu",
@@ -287,7 +279,7 @@ static void DeleteObsoleteFiles(
       ++deleted;
     }
   }
-  Log(InfoLogLevel::INFO_LEVEL, cfs.info_log_,
+  Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
       "[pg] Obsolete deletion summary: requested=%zu deleted=%zu failures=%zu",
       obsolete_files.size(), deleted, failures);
 }
