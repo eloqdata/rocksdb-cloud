@@ -1,13 +1,12 @@
 // Copyright (c) 2017 Rockset.
 #ifndef ROCKSDB_LITE
 
-#include "cloud/manifest_reader.h"
-
 #include <unordered_map>
 
 #include "cloud/cloud_manifest.h"
 #include "cloud/db_cloud_impl.h"
 #include "cloud/filename.h"
+#include "cloud/manifest_reader.h"
 #include "db/version_set.h"
 #include "env/composite_env_wrapper.h"
 #include "rocksdb/cloud/cloud_file_system_impl.h"
@@ -22,9 +21,8 @@ LocalManifestReader::LocalManifestReader(std::shared_ptr<Logger> info_log,
                                          CloudFileSystem *cfs)
     : info_log_(std::move(info_log)), cfs_(cfs) {}
 
-IOStatus
-LocalManifestReader::GetLiveFilesLocally(const std::string &local_dbname,
-                                         std::set<uint64_t> *list) const {
+IOStatus LocalManifestReader::GetLiveFilesLocally(
+    const std::string &local_dbname, std::set<uint64_t> *list) const {
   auto *cfs_impl = dynamic_cast<CloudFileSystemImpl *>(cfs_);
   assert(cfs_impl);
   // cloud manifest should be set in CloudFileSystem, and it should map to local
@@ -55,9 +53,8 @@ LocalManifestReader::GetLiveFilesLocally(const std::string &local_dbname,
   return GetLiveFilesFromFileReader(std::move(manifest_file_reader), list);
 }
 
-IOStatus
-LocalManifestReader::GetManifestLiveFiles(const std::string &manifest_file,
-                                          std::set<uint64_t> *list) const {
+IOStatus LocalManifestReader::GetManifestLiveFiles(
+    const std::string &manifest_file, std::set<uint64_t> *list) const {
   auto *cfs_impl = dynamic_cast<CloudFileSystemImpl *>(cfs_);
   assert(cfs_impl);
 
@@ -91,8 +88,8 @@ IOStatus LocalManifestReader::GetLiveFilesFromFileReader(
   std::string scratch;
 
   // keep track of each CF's live files on each level
-  std::unordered_map<uint32_t,               // CF id
-                     std::unordered_map<int, // level
+  std::unordered_map<uint32_t,                // CF id
+                     std::unordered_map<int,  // level
                                         std::unordered_set<uint64_t>>>
       cf_live_files;
 
@@ -264,5 +261,5 @@ IOStatus ManifestReader::GetMaxFileNumberFromManifest(FileSystem *fs,
   }
   return s;
 }
-} // namespace ROCKSDB_NAMESPACE
+}  // namespace ROCKSDB_NAMESPACE
 #endif /* ROCKSDB_LITE */
