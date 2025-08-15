@@ -913,8 +913,9 @@ IOStatus CloudFileSystemImpl::LoadLocalCloudManifest(
                                                cookie, &cloud_manifest_);
 }
 
-std::string RemapFilenameWithCloudManifest(const std::string& logical_path,
-                                           CloudManifest* cloud_manifest) {
+std::string CloudFileSystemImpl::RemapFilenameWithCloudManifest(
+                                 const std::string& logical_path,
+                                 CloudManifest* cloud_manifest) const {
   auto file_name = basename(logical_path);
   uint64_t fileNumber;
   FileType type;
@@ -2286,7 +2287,10 @@ Status CloudFileSystemImpl::PrepareOptions(const ConfigOptions& options) {
     return status;
   }
   // start the purge thread only if there is a destination bucket
-  if (cloud_fs_options.dest_bucket.IsValid() && cloud_fs_options.run_purger) {
+  // and run_purger is true and purge_thread_ is not already running
+  if (cloud_fs_options.dest_bucket.IsValid() &&
+      cloud_fs_options.run_purger &&
+      !purge_thread_.joinable()) {
     CloudFileSystemImpl* cloud = this;
     purge_thread_ = std::thread([cloud] { cloud->Purger(); });
   }
@@ -2399,9 +2403,9 @@ IOStatus CloudFileSystemImpl::BackupCloudManifest(const std::string& dest_folder
   std::string dest_path = "/" + dest_folder;
 
   // Copy CLOUDMANIFEST to the backup location
-  std::string cloud_manifest_src = 
+  std::string cloud_manifest_src =
       MakeCloudManifestFile(src_path, cloud_fs_options.new_cookie_on_open);
-  std::string cloud_manifest_dest = 
+  std::string cloud_manifest_dest =
       MakeCloudManifestFile(dest_path, cloud_fs_options.new_cookie_on_open);
 
   Log(InfoLogLevel::INFO_LEVEL, info_log_,

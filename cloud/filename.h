@@ -110,6 +110,18 @@ inline std::string RemoveEpoch(const std::string& path) {
   return path;
 }
 
+inline std::string GetEpoch(const std::string& path) {
+  auto lastDash = path.rfind('-');
+  if (lastDash == std::string::npos) {
+    return "";
+  }
+  auto lastPathPos = path.rfind('/');
+  if (lastPathPos == std::string::npos || lastDash > lastPathPos) {
+    return path.substr(lastDash + 1);
+  }
+  return "";
+}
+
 // Get the cookie suffix from cloud manifest file path
 inline std::string GetCookie(const std::string& cloud_manifest_file_path) {
   auto cloud_manifest_fname = basename(cloud_manifest_file_path);

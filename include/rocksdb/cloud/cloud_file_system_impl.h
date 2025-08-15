@@ -196,6 +196,8 @@ class CloudFileSystemImpl : public CloudFileSystem {
   // Files both in S3 and in the local directory have this [epoch] suffix.
   std::string RemapFilename(const std::string& logical_path) const override;
 
+  std::string RemapFilenameWithCloudManifest(const std::string &logical_path,
+                                           CloudManifest *cloud_manifest) const;
   FileOptions OptimizeForLogRead(
       const FileOptions& file_options) const override {
     return base_fs_->OptimizeForLogRead(file_options);
@@ -302,7 +304,7 @@ class CloudFileSystemImpl : public CloudFileSystem {
   size_t TEST_NumScheduledJobs() const;
 #endif
 
-  // Buckup the CLOUDMANIFEST and MANIFEST files to cloud storage 
+  // Buckup the CLOUDMANIFEST and MANIFEST files to cloud storage
   // dest_folder is the folder where the files will be saved
   // the files will be saved as dest_bucket/dest_folder
   //
