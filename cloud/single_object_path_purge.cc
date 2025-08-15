@@ -221,6 +221,12 @@ static void SelectObsoleteFiles(
     Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
         "[pg] Checking candidate file %s", candidate.first.c_str());
     const std::string &candidate_file_path = candidate.first;
+
+    // Skip files that are not SST files
+    if (!ends_with(RemoveEpoch(candidate_file_path), ".sst")) {
+      continue;
+    }
+
     const std::string candidate_file_epoch = GetEpoch(candidate_file_path);
     const CloudObjectInformation &candidate_file_info = candidate.second;
     uint64_t candidate_modification_time =
@@ -235,10 +241,6 @@ static void SelectObsoleteFiles(
     }
 
     if (live_files.find(candidate_file_path) != live_files.end()) {
-      continue;
-    }
-
-    if (!ends_with(RemoveEpoch(candidate_file_path), ".sst")) {
       continue;
     }
 
