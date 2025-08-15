@@ -116,10 +116,10 @@ inline std::string GetEpoch(const std::string& path) {
     return "";
   }
   auto lastPathPos = path.rfind('/');
-  if (lastPathPos == std::string::npos || lastDash < lastPathPos) {
+  if (lastPathPos == std::string::npos || lastDash > lastPathPos) {
     return path.substr(lastDash + 1);
   }
-  return path.substr(lastPathPos + 1, lastDash - lastPathPos - 1);
+  return "";
 }
 
 // Get the cookie suffix from cloud manifest file path
