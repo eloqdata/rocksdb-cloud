@@ -330,6 +330,10 @@ class GcsStorageProvider : public CloudStorageProviderImpl {
   IOStatus ListCloudObjects(std::string const& bucket_name,
                             std::string const& object_path,
                             std::vector<std::string>* result) override;
+  IOStatus ListCloudObjects(const std::string& bucket_name,
+                            const std::string& object_path,
+                            std::vector<std::pair<std::string,
+                            CloudObjectInformation>>* result) override;
   IOStatus ListCloudObjectsWithPrefix(const std::string& bucket_name,
                                     const std::string& object_path,
 				    const std::string& object_prefix,
@@ -446,6 +450,13 @@ IOStatus GcsStorageProvider::EmptyBucket(std::string const& bucket_name,
     }
   }
   return IOStatus::OK();
+}
+
+IOStatus GcsStorageProvider::ListCloudObjects(const std::string& bucket_name,
+                          const std::string& object_path,
+                          std::vector<std::pair<std::string,
+                          CloudObjectInformation>>* result) {
+  return IOStatus::NotSupported("GcsStorageProvider::ListCloudObjects");
 }
 
 IOStatus GcsStorageProvider::DeleteCloudObject(std::string const& bucket_name,
