@@ -644,6 +644,10 @@ class CloudFileSystem : public FileSystem {
   virtual IOStatus GetMaxFileNumberFromCurrentManifest(
       const std::string& local_dbname, uint64_t* max_file_number) = 0;
 
+  // Roll a new database branch with a new cookie
+  virtual IOStatus RollNewBranch(const std::string& local_dbname,
+                                 const std::string& branch_cookie) = 0;
+
   // Delete both local and cloud invisble files
   virtual IOStatus DeleteCloudInvisibleFiles(
       const std::vector<std::string>& active_cookies) = 0;
