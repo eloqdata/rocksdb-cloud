@@ -452,10 +452,10 @@ IOStatus GcsStorageProvider::EmptyBucket(std::string const& bucket_name,
   return IOStatus::OK();
 }
 
-IOStatus GcsStorageProvider::ListCloudObjects(const std::string& bucket_name,
-                          const std::string& object_path,
+IOStatus GcsStorageProvider::ListCloudObjects(const std::string& /*bucket_name*/,
+                          const std::string& /*object_path*/,
                           std::vector<std::pair<std::string,
-                          CloudObjectInformation>>* result) {
+                          CloudObjectInformation>>* /*result*/) {
   return IOStatus::NotSupported("GcsStorageProvider::ListCloudObjects");
 }
 
