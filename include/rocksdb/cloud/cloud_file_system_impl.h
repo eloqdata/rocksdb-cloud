@@ -371,6 +371,10 @@ class CloudFileSystemImpl : public CloudFileSystem {
 
   IOStatus RollNewEpoch(const std::string& local_dbname);
 
+  // Roll a new database branch with a new cookie
+  IOStatus RollNewBranch(const std::string& local_dbname,
+                         const std::string& branch_cookie);
+
   // helper methods to access the file cache
   void FileCacheAccess(const std::string& fname);
 

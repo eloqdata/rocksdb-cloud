@@ -2025,6 +2025,26 @@ IOStatus CloudFileSystemImpl::RollNewEpoch(const std::string& local_dbname) {
   return st;
 }
 
+IOStatus CloudFileSystemImpl::RollNewBranch(const std::string& local_dbname,
+    const std::string& branch_cookie) {
+  uint64_t maxFileNumber;
+  auto st = ManifestReader::GetMaxFileNumberFromManifest(
+      this, local_dbname + "/MANIFEST-000001", &maxFileNumber);
+  if (!st.ok()) {
+    // uh oh
+    return st;
+  }
+  // roll new epoch
+  auto newEpoch = GenerateNewEpochId();
+  // To make sure `RollNewEpoch` is backwards compatible, we don't change
+  // the cookie when applying CM delta
+  auto cloudManifestDelta = CloudManifestDelta{maxFileNumber, newEpoch};
+
+  st = RollNewCookie(local_dbname, branch_cookie, cloudManifestDelta);
+
+  return st;
+}
+
 IOStatus CloudFileSystemImpl::UploadManifest(const std::string& local_dbname,
                                              const std::string& epoch) const {
   if (!HasDestBucket()) {
