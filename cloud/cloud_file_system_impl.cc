@@ -2031,10 +2031,9 @@ IOStatus CloudFileSystemImpl::RollNewBranch(const std::string& local_dbname,
   auto st = ManifestReader::GetMaxFileNumberFromManifest(
       this, local_dbname + "/MANIFEST-000001", &maxFileNumber);
   if (!st.ok()) {
-    // uh oh
     return st;
   }
-  // roll new epoch
+  // Roll new epoch for the branch
   auto newEpoch = GenerateNewEpochId();
   // To make sure `RollNewEpoch` is backwards compatible, we don't change
   // the cookie when applying CM delta
