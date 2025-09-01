@@ -141,6 +141,82 @@ IOStatus LocalManifestReader::GetLiveFilesFromFileReader(
   return status_to_io_status(std::move(s));
 }
 
+IOStatus LocalManifestReader::GetLiveFilesAndMaxFileNumFromFileReader(
+    std::unique_ptr<SequentialFileReader> file_reader, std::set<uint64_t> *list,
+    uint64_t *max_file_num) const {
+  Status s;
+  // create a callback that gets invoked whil looping through the log records
+  VersionSet::LogReporter reporter;
+  reporter.status = &s;
+  log::Reader reader(nullptr, std::move(file_reader), &reporter,
+                     true /*checksum*/, 0);
+
+  Slice record;
+  std::string scratch;
+
+  // keep track of each CF's live files on each level
+  std::unordered_map<uint32_t,                // CF id
+                     std::unordered_map<int,  // level
+                                        std::unordered_set<uint64_t>>>
+      cf_live_files;
+
+  *max_file_num = 0;
+  while (reader.ReadRecord(&record, &scratch) && s.ok()) {
+    VersionEdit edit;
+    s = edit.DecodeFrom(record);
+    if (!s.ok()) {
+      break;
+    }
+
+    uint64_t f;
+    if (edit.GetNextFileNumber(&f)) {
+      // Disabled temporarily.
+      // TODO: Reenable once the cloud manifest consistency issue is addressed.
+      // assert(*maxFileNumber <= f);
+      *max_file_num = f;
+    }
+
+    // add the files that are added by this transaction
+    std::vector<std::pair<int, FileMetaData>> new_files = edit.GetNewFiles();
+    for (auto &one : new_files) {
+      uint64_t num = one.second.fd.GetNumber();
+      cf_live_files[edit.GetColumnFamily()][one.first].insert(num);
+    }
+    // delete the files that are removed by this transaction
+    std::set<std::pair<int, uint64_t>> deleted_files = edit.GetDeletedFiles();
+    for (auto &one : deleted_files) {
+      int level = one.first;
+      uint64_t num = one.second;
+      // Deleted files should belong to some CF
+      auto it = cf_live_files.find(edit.GetColumnFamily());
+      if ((it == cf_live_files.end()) || (it->second.count(level) == 0) ||
+          (it->second[level].count(num) == 0)) {
+        return IOStatus::Corruption(
+            "Corrupted Manifest file with unrecognized deleted file: " +
+            std::to_string(level) + "," + std::to_string(num));
+      }
+      it->second[level].erase(num);
+    }
+
+    // Removing the files from dropped CF, since we don't mark the files as
+    // deleted in Manifest when a CF is dropped,
+    if (edit.IsColumnFamilyDrop()) {
+      cf_live_files.erase(edit.GetColumnFamily());
+    }
+  }
+
+  for (auto &[cf_id, live_files] : cf_live_files) {
+    for (auto &[level, level_live_files] : live_files) {
+      (void)cf_id;
+      (void)level;
+      list->insert(level_live_files.begin(), level_live_files.end());
+    }
+  }
+
+  file_reader.reset();
+  return status_to_io_status(std::move(s));
+}
+
 ManifestReader::ManifestReader(std::shared_ptr<Logger> info_log,
                                CloudFileSystem *cfs,
                                const std::string &bucket_prefix)
@@ -214,6 +290,31 @@ IOStatus ManifestReader::GetLiveFiles(const std::string &bucket_path,
   }
 
   return GetLiveFilesFromFileReader(std::move(file_reader), list);
+}
+
+IOStatus ManifestReader::GetLiveFilesAndMaxFileNum(
+    const std::string &bucket_path, const std::string &epoch,
+    std::set<uint64_t> *list, uint64_t *max_file_num) const {
+  auto manifestFile = ManifestFileWithEpoch(bucket_path, epoch);
+
+  IOStatus s;
+  std::unique_ptr<CloudManifest> cloud_manifest;
+  const FileOptions file_opts;
+  IODebugContext *dbg = nullptr;
+
+  std::unique_ptr<SequentialFileReader> file_reader;
+  {
+    std::unique_ptr<FSSequentialFile> file;
+    s = cfs_->NewSequentialFileCloud(bucket_prefix_, manifestFile, file_opts,
+                                     &file, dbg);
+    if (!s.ok()) {
+      return s;
+    }
+    file_reader.reset(new SequentialFileReader(std::move(file), manifestFile));
+  }
+
+  return GetLiveFilesAndMaxFileNumFromFileReader(std::move(file_reader), list,
+                                                 max_file_num);
 }
 
 IOStatus ManifestReader::GetMaxFileNumberFromManifest(FileSystem *fs,

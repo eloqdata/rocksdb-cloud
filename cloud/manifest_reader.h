@@ -45,6 +45,13 @@ class LocalManifestReader {
       std::unique_ptr<SequentialFileReader> file_reader,
       std::set<uint64_t>* list) const;
 
+  // Get the live files and the max file number
+  // by reading version_edit records from file_reader
+  IOStatus GetLiveFilesAndMaxFileNumFromFileReader(
+      std::unique_ptr<SequentialFileReader> file_reader,
+      std::set<uint64_t>* list,
+      uint64_t *max_file_num) const;
+
   std::shared_ptr<Logger> info_log_;
   CloudFileSystem* cfs_;
 };
@@ -67,6 +74,11 @@ class ManifestReader : public LocalManifestReader {
   IOStatus GetLiveFiles(const std::string& bucket_path,
                         const std::string& epoch,
                         std::set<uint64_t>* list) const;
+
+  IOStatus GetLiveFilesAndMaxFileNum(const std::string& bucket_path,
+                        const std::string& epoch,
+                        std::set<uint64_t>* list,
+                        uint64_t *max_file_num) const;
 
   static IOStatus GetMaxFileNumberFromManifest(FileSystem* fs,
                                                const std::string& fname,

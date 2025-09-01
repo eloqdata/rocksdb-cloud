@@ -49,7 +49,7 @@ struct PurgerCycleState {
   PurgerCloudManifestMap cloudmanifests;  // loaded cloud manifest objects
   PurgerLiveFileSet live_file_names;      // logical filenames considered live
   PurgerEpochManifestMap
-      current_epoch_manifest_files;         // epoch -> manifest file metadata
+      epoch_manifest_files;                 // epoch -> manifest file metadata
   std::vector<std::string> obsolete_files;  // files selected for deletion
 };
 
@@ -180,7 +180,7 @@ static IOStatus CollectLiveFiles(CloudFileSystemImpl &cfs,
       continue;
     }
 
-    Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
+    Log(InfoLogLevel::INFO_LEVEL, cfs.info_log_,
         "[pg] Current epoch Manifest file %s of CloudManifest %s has size %lu "
         "and content hash %s and timestamp %lu",
         manifest_file.c_str(), cloud_manifest_name.c_str(),
@@ -189,8 +189,9 @@ static IOStatus CollectLiveFiles(CloudFileSystemImpl &cfs,
 
     (*epoch_manifest_infos)[current_epoch] = manifest_file_info;
 
-    s = manifest_reader->GetLiveFiles(dest_object_path, current_epoch,
-                                      &live_file_numbers);
+    uint64_t max_file_number = 0;
+    s = manifest_reader->GetLiveFilesAndMaxFileNum(
+        dest_object_path, current_epoch, &live_file_numbers, &max_file_number);
     if (!s.ok()) {
       Log(InfoLogLevel::ERROR_LEVEL, cfs.info_log_,
           "[pg] Failed to get live files from cloud manifest file %s: %s",
@@ -199,12 +200,18 @@ static IOStatus CollectLiveFiles(CloudFileSystemImpl &cfs,
       continue;
     }
 
+    Log(InfoLogLevel::INFO_LEVEL, cfs.info_log_,
+        "[pg] Found %zu live files and max file number %lu from cloud "
+        "manifest %s, current epoch %s",
+        live_file_numbers.size(), max_file_number, cloud_manifest_name.c_str(),
+        current_epoch.c_str());
+
     for (const auto &num : live_file_numbers) {
       std::string file_name = MakeTableFileName(num);
       file_name =
           cfs.RemapFilenameWithCloudManifest(file_name, cloud_manifest_ptr);
       live_files->insert(file_name);
-      Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
+      Log(InfoLogLevel::INFO_LEVEL, cfs.info_log_,
           "[pg] Live file %s found in cloud manifest %s", file_name.c_str(),
           cloud_manifest_name.c_str());
     }
@@ -218,7 +225,7 @@ static void SelectObsoleteFiles(
     const PurgerEpochManifestMap &epoch_manifest_infos,
     std::vector<std::string> *obsolete_files) {
   for (const auto &candidate : all_files) {
-    Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
+    Log(InfoLogLevel::INFO_LEVEL, cfs.info_log_,
         "[pg] Checking candidate file %s", candidate.first.c_str());
     const std::string &candidate_file_path = candidate.first;
 
@@ -246,11 +253,11 @@ static void SelectObsoleteFiles(
 
     if (candidate_modification_time < manifest_modification_time) {
       obsolete_files->push_back(candidate_file_path);
-      Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
+      Log(InfoLogLevel::INFO_LEVEL, cfs.info_log_,
           "[pg] Candidate file %s is obsolete and will be deleted",
           candidate_file_path.c_str());
     } else {
-      Log(InfoLogLevel::DEBUG_LEVEL, cfs.info_log_,
+      Log(InfoLogLevel::INFO_LEVEL, cfs.info_log_,
           "[pg] Candidate file %s is not obsolete because its modification "
           "time %lu is later than the current epoch manifest file's "
           "modification time %lu",
@@ -307,14 +314,13 @@ static void RunSinglePurgeCycle(CloudFileSystemImpl &cfs) {
   }
 
   if (!CollectLiveFiles(cfs, state.cloudmanifests, &state.live_file_names,
-                        &state.current_epoch_manifest_files)
+                        &state.epoch_manifest_files)
            .ok()) {
     return;
   }
 
   SelectObsoleteFiles(cfs, state.all_files, state.live_file_names,
-                      state.current_epoch_manifest_files,
-                      &state.obsolete_files);
+                      state.epoch_manifest_files, &state.obsolete_files);
 
   DeleteObsoleteFiles(cfs, state.obsolete_files);
 
