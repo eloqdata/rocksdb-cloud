@@ -270,6 +270,9 @@ class CloudFileSystemImpl : public CloudFileSystem {
                          const std::string& cookie,
                          const CloudManifestDelta& delta) const override;
 
+  IOStatus RollNewBranch(const std::string& local_dbname,
+                         const std::string& branch_cookie) override;
+
   IOStatus GetMaxFileNumberFromCurrentManifest(
       const std::string& local_dbname, uint64_t* max_file_number) override;
 
@@ -370,10 +373,6 @@ class CloudFileSystemImpl : public CloudFileSystem {
   IOStatus FetchCloudManifest(const std::string& local_dbname);
 
   IOStatus RollNewEpoch(const std::string& local_dbname);
-
-  // Roll a new database branch with a new cookie
-  IOStatus RollNewBranch(const std::string& local_dbname,
-                         const std::string& branch_cookie);
 
   // helper methods to access the file cache
   void FileCacheAccess(const std::string& fname);
