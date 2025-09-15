@@ -978,6 +978,7 @@ set(SOURCES
         cloud/manifest_reader.cc
         # cloud/purge.cc
         cloud/single_object_path_purge.cc
+        cloud/improved_purger.cc
         cloud/cloud_manifest.cc
         cloud/cloud_scheduler.cc
         cloud/cloud_storage_provider.cc
