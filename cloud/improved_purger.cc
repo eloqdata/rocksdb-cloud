@@ -21,7 +21,6 @@
  */
 
 #include <gflags/gflags.h>
-#include <glog/logging.h>
 
 #include <chrono>
 #include <iostream>
@@ -56,6 +55,21 @@ DEFINE_int32(file_number_grace_minutes, 5,
 
 namespace ROCKSDB_NAMESPACE {
 
+static bool PrerequisitesMet(const CloudFileSystemImpl &cfs) {
+  const CloudFileSystemOptions &cfs_opts = cfs.GetCloudFileSystemOptions();
+  if (cfs_opts.src_bucket.IsValid() &&
+      !cfs_opts.src_bucket.GetObjectPath().empty() &&
+      cfs_opts.dest_bucket.IsValid() &&
+      !cfs_opts.dest_bucket.GetObjectPath().empty() &&
+      cfs_opts.src_bucket != cfs_opts.dest_bucket) {
+    Log(InfoLogLevel::ERROR_LEVEL, cfs.info_log_,
+        "[pg] Single Object Path Purger is not running because the "
+        "prerequisites are not met.");
+    return false;
+  }
+  return true;
+}
+
 /**
  * @brief S3 file updater for writing smallest file number to S3
  */
@@ -64,11 +78,13 @@ class S3FileNumberReader {
   S3FileNumberReader(
       const std::string &bucket_name, const std::string &s3_object_path,
       const std::string &epoch,
-      std::shared_ptr<rocksdb::CloudStorageProvider> storage_provider)
+      std::shared_ptr<rocksdb::CloudStorageProvider> storage_provider,
+      std::shared_ptr<rocksdb::Logger> info_log)
       : bucket_name_(bucket_name),
         s3_object_path_(s3_object_path),
         epoch_(epoch),
-        storage_provider_(storage_provider) {}
+        storage_provider_(storage_provider),
+        info_log_(info_log) {}
 
   ~S3FileNumberReader() = default;
 
@@ -84,21 +100,24 @@ class S3FileNumberReader {
         storage_provider_->GetCloudObject(bucket_name_, object_key, content);
 
     if (!s.ok()) {
-      DLOG(INFO) << "Failed to read smallest file number from S3: "
-                 << s.ToString() << ", object_key: " << object_key
-                 << ", returning UINT64_MIN";
+      Log(InfoLogLevel::INFO_LEVEL, nullptr,
+          "Failed to read smallest file number from S3: %s, object_key: %s, "
+          "returning UINT64_MIN",
+          s.ToString().c_str(), object_key.c_str());
       return std::numeric_limits<uint64_t>::min();
     }
 
     try {
       uint64_t file_number = std::stoull(content);
-      DLOG(INFO) << "Read smallest file number from S3: " << file_number
-                 << ", object_key: " << object_key;
+      Log(InfoLogLevel::INFO_LEVEL, nullptr,
+          "Read smallest file number from S3: %llu, object_key: %s",
+          static_cast<unsigned long long>(file_number), object_key.c_str());
       return file_number;
     } catch (const std::exception &e) {
-      LOG(ERROR) << "Failed to parse smallest file number from S3 content: '"
-                 << content << "', error: " << e.what()
-                 << ", object_key: " << object_key;
+      Log(InfoLogLevel::INFO_LEVEL, nullptr,
+          "Failed to parse smallest file number from S3 content: '%s', "
+          "returning UINT64_MIN",
+          content.c_str());
       return std::numeric_limits<uint64_t>::min();
     }
   }
@@ -108,6 +127,7 @@ class S3FileNumberReader {
   std::string s3_object_path_;
   std::string epoch_;
   std::shared_ptr<rocksdb::CloudStorageProvider> storage_provider_;
+  std::shared_ptr<rocksdb::Logger> info_log_;
 
   std::string GetS3ObjectKey() const {
     std::ostringstream oss;
@@ -175,19 +195,20 @@ class ImprovedPurger {
   };
 
  private:
-  std::shared_ptr<CloudFileSystemImpl> cfs_;
+  CloudFileSystemImpl *cfs_;
   std::string bucket_name_;
   std::string object_path_;
   bool dry_run_;
+  std::shared_ptr<Logger> info_log_;
 
  public:
-  ImprovedPurger(std::shared_ptr<CloudFileSystemImpl> cfs,
-                 const std::string &bucket_name, const std::string &object_path,
-                 bool dry_run)
+  ImprovedPurger(CloudFileSystemImpl *cfs, const std::string &bucket_name,
+                 const std::string &object_path, bool dry_run)
       : cfs_(cfs),
         bucket_name_(bucket_name),
         object_path_(object_path),
-        dry_run_(dry_run) {}
+        dry_run_(dry_run),
+        info_log_(cfs->info_log_) {}
 
   /**
    * @brief Run a single purge cycle with improved file number checking
@@ -195,8 +216,9 @@ class ImprovedPurger {
   void RunSinglePurgeCycle() {
     PurgerCycleState state;
 
-    LOG(INFO) << "[ImprovedPurger] Starting purge cycle for " << bucket_name_
-              << "/" << object_path_;
+    Log(InfoLogLevel::INFO_LEVEL, info_log_,
+        "[pg] Starting purge cycle for %s/%s", bucket_name_.c_str(),
+        object_path_.c_str());
 
     if (!ListAllFiles(&state.all_files)) {
       return;
@@ -222,26 +244,26 @@ class ImprovedPurger {
 
     // Enhanced selection with file number checking
     SelectObsoleteFilesWithThreshold(state.all_files, state.live_file_names,
-                                     state.current_epoch_manifest_files,
                                      state.file_number_thresholds,
                                      &state.obsolete_files);
 
     if (dry_run_) {
-      LOG(INFO) << "[ImprovedPurger] DRY RUN: Would delete "
-                << state.obsolete_files.size() << " files";
+      Log(InfoLogLevel::INFO_LEVEL, info_log_,
+          "[pg] DRY RUN: Would delete %zu files", state.obsolete_files.size());
       for (const auto &file : state.obsolete_files) {
-        LOG(INFO) << "[ImprovedPurger] DRY RUN: Would delete " << file;
+        Log(InfoLogLevel::INFO_LEVEL, info_log_,
+            "[pg] DRY RUN: Would delete %s", file.c_str());
       }
     } else {
       DeleteObsoleteFiles(state.obsolete_files);
     }
 
-    LOG(INFO) << "[ImprovedPurger] Purge cycle summary: total_files="
-              << state.all_files.size()
-              << " manifests=" << state.cloudmanifests.size()
-              << " live_files=" << state.live_file_names.size()
-              << " obsolete_selected=" << state.obsolete_files.size()
-              << " thresholds_loaded=" << state.file_number_thresholds.size();
+    Log(InfoLogLevel::INFO_LEVEL, info_log_,
+        "[pg] Purge cycle summary: total_files=%zu manifests=%zu "
+        "live_files=%zu obstolete_selected=%zu thresholds_loaded=%zu",
+        state.all_files.size(), state.cloudmanifests.size(),
+        state.live_file_names.size(), state.obsolete_files.size(),
+        state.file_number_thresholds.size());
   }
 
  private:
@@ -250,12 +272,14 @@ class ImprovedPurger {
         bucket_name_, object_path_, all_files);
 
     if (!s.ok()) {
-      LOG(ERROR) << "[ImprovedPurger] Failed to list files in " << object_path_
-                 << ": " << s.ToString();
+      Log(InfoLogLevel::ERROR_LEVEL, info_log_,
+          "[pg] Failed to list files in destination object path %s: %s",
+          object_path_.c_str(), s.ToString().c_str());
       return false;
     }
 
-    LOG(INFO) << "[ImprovedPurger] Listed " << all_files->size() << " files";
+    Log(InfoLogLevel::DEBUG_LEVEL, info_log_, "[pg] Total files listed: %zu",
+        all_files->size());
     return true;
   }
 
@@ -264,13 +288,14 @@ class ImprovedPurger {
         bucket_name_, object_path_, "CLOUDMANIFEST", cloud_manifest_files);
 
     if (!s.ok()) {
-      LOG(ERROR) << "[ImprovedPurger] Failed to list cloud manifests: "
-                 << s.ToString();
+      Log(InfoLogLevel::ERROR_LEVEL, info_log_,
+          "[pg] Failed to list cloud manifest files in bucket %s: %s",
+          bucket_name_.c_str(), s.ToString().c_str());
       return false;
     }
 
-    LOG(INFO) << "[ImprovedPurger] Found " << cloud_manifest_files->size()
-              << " cloud manifest files";
+    Log(InfoLogLevel::DEBUG_LEVEL, info_log_,
+        "[pg] Found %zu cloud manifest files", cloud_manifest_files->size());
     return true;
   }
 
@@ -287,8 +312,9 @@ class ImprovedPurger {
       IOStatus s = cfs_->NewSequentialFileCloud(bucket_name_, full_path,
                                                 file_opts, &file, dbg);
       if (!s.ok()) {
-        LOG(ERROR) << "[ImprovedPurger] Failed to open manifest "
-                   << cloud_manifest_file << ": " << s.ToString();
+        Log(InfoLogLevel::ERROR_LEVEL, info_log_,
+            "[pg] Failed to open cloud manifest file %s: %s",
+            cloud_manifest_file.c_str(), s.ToString().c_str());
         success = false;
         continue;
       }
@@ -300,14 +326,17 @@ class ImprovedPurger {
           &cloud_manifest);
 
       if (!s.ok()) {
-        LOG(ERROR) << "[ImprovedPurger] Failed to load manifest "
-                   << cloud_manifest_file << ": " << s.ToString();
+        Log(InfoLogLevel::ERROR_LEVEL, info_log_,
+            "[pg] Failed to load cloud manifest from file %s: %s",
+            cloud_manifest_file.c_str(), s.ToString().c_str());
         success = false;
         continue;
       }
 
-      LOG(INFO) << "[ImprovedPurger] Loaded manifest " << cloud_manifest_file
-                << " with epoch " << cloud_manifest->GetCurrentEpoch();
+      Log(InfoLogLevel::DEBUG_LEVEL, info_log_,
+          "[pg] Loaded cloud manifest file %s with current epoch %s",
+          cloud_manifest_file.c_str(),
+          cloud_manifest->GetCurrentEpoch().c_str());
 
       (*manifests)[cloud_manifest_file] = std::move(cloud_manifest);
     }
@@ -319,7 +348,7 @@ class ImprovedPurger {
                         PurgerLiveFileSet *live_files,
                         PurgerEpochManifestMap *epoch_manifest_infos) {
     std::unique_ptr<ManifestReader> manifest_reader(
-        new ManifestReader(cfs_->info_log_, cfs_.get(), bucket_name_));
+        new ManifestReader(cfs_->info_log_, cfs_, bucket_name_));
 
     std::set<uint64_t> live_file_numbers;
     bool success = true;
@@ -338,8 +367,9 @@ class ImprovedPurger {
           bucket_name_, manifest_file, &manifest_file_info);
 
       if (!s.ok()) {
-        LOG(ERROR) << "[ImprovedPurger] Failed to get metadata for manifest "
-                   << manifest_file << ": " << s.ToString();
+        Log(InfoLogLevel::ERROR_LEVEL, info_log_,
+            "[pg] Failed to get metadata for manifest file %s: %s",
+            manifest_file.c_str(), s.ToString().c_str());
         success = false;
         continue;
       }
@@ -349,9 +379,9 @@ class ImprovedPurger {
       s = manifest_reader->GetLiveFiles(object_path_, current_epoch,
                                         &live_file_numbers);
       if (!s.ok()) {
-        LOG(ERROR) << "[ImprovedPurger] Failed to get live files from "
-                      "manifest "
-                   << cloud_manifest_name << ": " << s.ToString();
+        Log(InfoLogLevel::ERROR_LEVEL, info_log_,
+            "[pg] Failed to get live files from cloud manifest file %s: %s",
+            cloud_manifest_name.c_str(), s.ToString().c_str());
         success = false;
         continue;
       }
@@ -361,7 +391,9 @@ class ImprovedPurger {
         file_name =
             cfs_->RemapFilenameWithCloudManifest(file_name, cloud_manifest_ptr);
         live_files->insert(file_name);
-        DLOG(INFO) << "[ImprovedPurger] Live file: " << file_name;
+        Log(InfoLogLevel::DEBUG_LEVEL, info_log_,
+            "[pg] Live file %s found in cloud manifest %s", file_name.c_str(),
+            cloud_manifest_name.c_str());
       }
     }
 
@@ -376,30 +408,31 @@ class ImprovedPurger {
 
       // Create S3 file number updater to read threshold
       auto s3_updater = std::make_unique<S3FileNumberReader>(
-          bucket_name_, object_path_, epoch, cfs_->GetStorageProvider());
+          bucket_name_, object_path_, epoch, cfs_->GetStorageProvider(),
+          info_log_);
 
       uint64_t threshold = s3_updater->ReadSmallestFileNumber();
       (*thresholds)[epoch] = threshold;
 
       if (threshold == std::numeric_limits<uint64_t>::max()) {
-        LOG(INFO) << "[ImprovedPurger] No file number threshold found "
-                     "for epoch "
-                  << epoch << " (using conservative approach)";
+        Log(InfoLogLevel::INFO_LEVEL, info_log_,
+            "[pg] No file number threshold found for epoch %s (using "
+            "conservative approach)",
+            epoch.c_str());
       } else {
-        LOG(INFO) << "[ImprovedPurger] Loaded file number threshold "
-                  << threshold << " for epoch " << epoch;
+        Log(InfoLogLevel::INFO_LEVEL, info_log_,
+            "[pg] Loaded file number threshold %llu for epoch %s",
+            static_cast<unsigned long long>(threshold), epoch.c_str());
       }
     }
   }
 
   void SelectObsoleteFilesWithThreshold(
       const PurgerAllFiles &all_files, const PurgerLiveFileSet &live_files,
-      const PurgerEpochManifestMap &epoch_manifest_infos,
       const PurgerFileNumberThresholds &thresholds,
       std::vector<std::string> *obsolete_files) {
     for (const auto &candidate : all_files) {
       const std::string &candidate_file_path = candidate.first;
-      const CloudObjectInformation &candidate_file_info = candidate.second;
 
       // Skip non-SST files
       if (!ends_with(RemoveEpoch(candidate_file_path), ".sst")) {
@@ -412,20 +445,11 @@ class ImprovedPurger {
       }
 
       std::string candidate_epoch = GetEpoch(candidate_file_path);
-      uint64_t candidate_modification_time =
-          candidate_file_info.modification_time;
-
-      // Get manifest modification time
-      uint64_t manifest_modification_time =
-          std::numeric_limits<uint64_t>::max();
-      auto epoch_it = epoch_manifest_infos.find(candidate_epoch);
-      if (epoch_it != epoch_manifest_infos.end()) {
-        manifest_modification_time = epoch_it->second.modification_time;
-      }
 
       // NEW: Check file number threshold
-      bool safe_by_file_number = true;
       auto threshold_it = thresholds.find(candidate_epoch);
+      assert(threshold_it != thresholds.end() &&
+             "Thresholds should have been loaded for all epochs");
       if (threshold_it != thresholds.end()) {
         uint64_t threshold = threshold_it->second;
         if (threshold != std::numeric_limits<uint64_t>::max()) {
@@ -434,28 +458,28 @@ class ImprovedPurger {
           std::string base_name = RemoveEpoch(candidate_file_path);
           if (ParseFileName(base_name, &file_number, nullptr)) {
             if (file_number >= threshold) {
-              safe_by_file_number = false;
-              DLOG(INFO) << "[ImprovedPurger] File " << candidate_file_path
-                         << " protected by file number threshold "
-                            "(file_num="
-                         << file_number << ", threshold=" << threshold << ")";
+              Log(InfoLogLevel::DEBUG_LEVEL, info_log_,
+                  "[pg] Skipping obsolete file %s due to file number "
+                  "threshold (file_num=%llu, threshold=%llu)",
+                  candidate_file_path.c_str(),
+                  static_cast<unsigned long long>(file_number),
+                  static_cast<unsigned long long>(threshold));
+            } else {
+              obsolete_files->push_back(candidate_file_path);
+              Log(InfoLogLevel::DEBUG_LEVEL, info_log_,
+                  "[pg] File %s selected for deletion (file_num=%llu, "
+                  "threshold=%llu)",
+                  candidate_file_path.c_str(),
+                  static_cast<unsigned long long>(file_number),
+                  static_cast<unsigned long long>(threshold));
             }
           }
         }
-      }
-
-      // Apply both time-based and file number-based checks
-      if (safe_by_file_number &&
-          candidate_modification_time < manifest_modification_time) {
-        obsolete_files->push_back(candidate_file_path);
-        DLOG(INFO) << "[ImprovedPurger] File " << candidate_file_path
-                   << " is obsolete";
       } else {
-        DLOG(INFO) << "[ImprovedPurger] File " << candidate_file_path
-                   << " is protected (safe_by_file_number="
-                   << safe_by_file_number
-                   << ", candidate_time=" << candidate_modification_time
-                   << ", manifest_time=" << manifest_modification_time << ")";
+        Log(InfoLogLevel::INFO_LEVEL, info_log_,
+            "[pg] No threshold for epoch %s, using conservative approach - "
+            "not deleting file %s",
+            candidate_epoch.c_str(), candidate_file_path.c_str());
       }
     }
   }
@@ -466,25 +490,81 @@ class ImprovedPurger {
 
     for (const auto &file_to_delete : obsolete_files) {
       std::string file_path = object_path_ + "/" + file_to_delete;
-      LOG(INFO) << "[ImprovedPurger] Deleting obsolete file " << file_to_delete;
+      Log(InfoLogLevel::INFO_LEVEL, info_log_,
+          "[pg] Deleting obsolete file %s from destination bucket",
+          file_to_delete.c_str());
 
       IOStatus s = cfs_->GetStorageProvider()->DeleteCloudObject(bucket_name_,
                                                                  file_path);
       if (!s.ok()) {
         ++failures;
-        LOG(ERROR) << "[ImprovedPurger] Failed to delete " << file_path << ": "
-                   << s.ToString();
+        Log(InfoLogLevel::ERROR_LEVEL, info_log_,
+            "[pg] Failed to delete obsolete file %s: %s", file_path.c_str(),
+            s.ToString().c_str());
       } else {
         ++deleted;
       }
     }
 
-    LOG(INFO) << "[ImprovedPurger] Deletion summary: requested="
-              << obsolete_files.size() << " deleted=" << deleted
-              << " failures=" << failures;
+    Log(InfoLogLevel::DEBUG_LEVEL, info_log_,
+        "[pg] Obsolete deletion summary: requested=%zu deleted=%zu "
+        "failures=%zu",
+        obsolete_files.size(), deleted, failures);
   }
 };
 
+// ------------- Main purger thread ------------- //
+
+void CloudFileSystemImpl::Purger() {
+  Log(InfoLogLevel::INFO_LEVEL, info_log_,
+      "[pg] Single Object Path Purger thread started");
+
+  if (!PrerequisitesMet(*this)) {
+    return;
+  }
+
+  const auto periodicity_ms =
+      GetCloudFileSystemOptions().purger_periodicity_millis;
+
+  auto purger = std::make_unique<ImprovedPurger>(
+      this, GetDestBucketName(), GetDestObjectPath(), FLAGS_dry_run);
+
+  while (true) {
+    // Wait for next cycle or termination request
+    std::unique_lock<std::mutex> lk(purger_lock_);
+    purger_cv_.wait_for(lk, std::chrono::milliseconds(periodicity_ms),
+                        [&]() { return !purger_is_running_; });
+    if (!purger_is_running_) {
+      break;  // shutdown requested
+    }
+    lk.unlock();  // release lock during IO work
+
+    purger->RunSinglePurgeCycle();
+  }
+
+  Log(InfoLogLevel::INFO_LEVEL, info_log_,
+      "[pg] Single Object Path Purger thread exiting");
+}
+
+IOStatus CloudFileSystemImpl::FindObsoleteFiles(
+    const std::string & /*bucket_name_prefix*/,
+    std::vector<std::string> * /*pathnames*/) {
+  return IOStatus::NotSupported(
+      "Single Object Path Purger does not support FindObsoleteFiles");
+}
+IOStatus CloudFileSystemImpl::FindObsoleteDbid(
+    const std::string & /*bucket_name_prefix*/,
+    std::vector<std::string> * /*to_delete_list*/) {
+  return IOStatus::NotSupported(
+      "Single Object Path Purger does not support FindObsoleteDbid");
+}
+
+IOStatus CloudFileSystemImpl::extractParents(
+    const std::string & /*bucket_name_prefix*/, const DbidList & /*dbid_list*/,
+    DbidParents * /*parents*/) {
+  return IOStatus::NotSupported(
+      "Single Object Path Purger does not support extractParents");
+}
 }  // namespace ROCKSDB_NAMESPACE
 
 inline rocksdb::Status NewCloudFileSystem(
@@ -507,11 +587,6 @@ inline rocksdb::Status NewCloudFileSystem(
 int main(int argc, char *argv[]) {
   // Initialize gflags and glog
   gflags::ParseCommandLineFlags(&argc, &argv, true);
-  google::InitGoogleLogging(argv[0]);
-
-  // Set log level to INFO by default
-  FLAGS_logtostderr = 1;
-  FLAGS_minloglevel = 0;  // INFO level
 
   if (FLAGS_s3_url.empty()) {
     std::cerr << "Error: --s3_url is required\n";
@@ -535,15 +610,16 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  LOG(INFO) << "Starting improved purger for S3 URL: " << FLAGS_s3_url;
-  LOG(INFO) << "Parsed - Bucket: " << bucket_name
-            << ", Object Path: " << object_path;
-  LOG(INFO) << "Configuration - Purge Interval: "
+  std::cout << "Starting improved purger for S3 URL: " << FLAGS_s3_url
+            << std::endl;
+  std::cout << "Purge Interval: " << FLAGS_purge_interval_seconds << " seconds"
+            << std::endl;
+  std::cout << "Configuration - Purge Interval: "
             << FLAGS_purge_interval_seconds
             << "s, Dry Run: " << (FLAGS_dry_run ? "true" : "false")
             << ", AWS Region: " << FLAGS_aws_region
             << ", File Number Grace: " << FLAGS_file_number_grace_minutes
-            << " minutes";
+            << " minutes" << std::endl;
 
   try {
     // Create CloudFileSystemOptions
@@ -555,45 +631,59 @@ int main(int argc, char *argv[]) {
     cfs_options.purger_periodicity_millis = FLAGS_purge_interval_seconds * 1000;
 
     // Create CloudFileSystem
-    std::shared_ptr<ROCKSDB_NAMESPACE::CloudFileSystem> cloud_fs;
     rocksdb::CloudFileSystem *cfs;
     ROCKSDB_NAMESPACE::Status s = NewCloudFileSystem(cfs_options, &cfs);
-    cloud_fs.reset(cfs);
 
     if (!s.ok()) {
-      LOG(FATAL) << "Failed to create CloudFileSystem: " << s.ToString();
+      std::cerr << "Error: Failed to create CloudFileSystem: " << s.ToString()
+                << std::endl;
       return 1;
     }
 
-    auto cfs_impl =
-        std::dynamic_pointer_cast<ROCKSDB_NAMESPACE::CloudFileSystemImpl>(
-            cloud_fs);
+    std::unique_ptr<ROCKSDB_NAMESPACE::CloudFileSystem> cloud_fs;
+    cloud_fs.reset(cfs);
+
+    auto *cfs_impl =
+        dynamic_cast<ROCKSDB_NAMESPACE::CloudFileSystemImpl *>(cloud_fs.get());
     if (!cfs_impl) {
-      LOG(FATAL) << "Failed to cast to CloudFileSystemImpl";
+      std::cerr << "Error: CloudFileSystem is not of expected type"
+                << std::endl;
       return 1;
     }
+
+    rocksdb::Options options;
+    s = ROCKSDB_NAMESPACE::CreateLoggerFromOptions("improved_purger", options,
+                                                   &options.info_log);
+    if (!s.ok()) {
+      std::cerr << "Error: Failed to create logger: " << s.ToString()
+                << std::endl;
+      return 1;
+    }
+    cfs_impl->info_log_ = options.info_log;
 
     // Create and run improved purger
     ROCKSDB_NAMESPACE::ImprovedPurger purger(cfs_impl, bucket_name, object_path,
                                              FLAGS_dry_run);
 
-    // Run purge cycles
-    while (true) {
-      auto start_time = std::chrono::steady_clock::now();
-
-      purger.RunSinglePurgeCycle();
-
-      auto end_time = std::chrono::steady_clock::now();
-      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-          end_time - start_time);
-      LOG(INFO) << "Purge cycle completed in " << duration.count() << "ms";
-
-      // Sleep until next cycle
-      std::this_thread::sleep_for(
-          std::chrono::seconds(FLAGS_purge_interval_seconds));
+    if (!ROCKSDB_NAMESPACE::PrerequisitesMet(*cfs_impl)) {
+      std::cerr << "Error: Prerequisites for purger not met" << std::endl;
+      return 1;
     }
+
+    // Run purge cycles
+    auto start_time = std::chrono::steady_clock::now();
+
+    purger.RunSinglePurgeCycle();
+
+    auto end_time = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end_time - start_time);
+    rocksdb::Log(rocksdb::InfoLogLevel::INFO_LEVEL, cfs_impl->info_log_,
+                 "[pg] Purge cycle completed in %lld ms",
+                 static_cast<long long>(duration.count()));
+
   } catch (const std::exception &e) {
-    LOG(FATAL) << "Exception: " << e.what();
+    Log(rocksdb::InfoLogLevel::ERROR_LEVEL, nullptr, "Exception: %s", e.what());
     return 1;
   }
 

@@ -26,8 +26,7 @@ LIB_SOURCES =                                                   \
   cloud/cloud_file_system_impl.cc                               \
   cloud/cloud_log_controller.cc                                 \
   cloud/manifest_reader.cc                                      \
-  cloud/single_object_path_purge.cc                             \
-  cloud/improved_purger.cc                             \
+  cloud/improved_purger.cc                                      \
   cloud/cloud_manifest.cc                                       \
   cloud/cloud_scheduler.cc                                      \
   cloud/cloud_storage_provider.cc                               \
