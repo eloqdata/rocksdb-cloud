@@ -67,6 +67,9 @@ class DBCloud : public StackableDB {
                                    const std::string& name,
                                    std::vector<std::string>* column_families);
 
+  // Returns the current epoch string
+  virtual Status GetCurrentEpoch(std::string *epoch) const = 0;
+
   virtual ~DBCloud() {}
 
  protected:
