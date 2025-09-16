@@ -297,7 +297,7 @@ class ImprovedPurger {
 
     Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
         "[pg] Purge cycle summary: total_files=%zu manifests=%zu "
-        "live_files=%zu obstolete_selected=%zu thresholds_loaded=%zu",
+        "live_files=%zu obsolete_selected=%zu thresholds_loaded=%zu",
         state.all_files.size(), state.cloudmanifests.size(),
         state.live_file_names.size(), state.obsolete_files.size(),
         state.file_number_thresholds.size());
@@ -486,13 +486,14 @@ class ImprovedPurger {
              "Thresholds should have been loaded for all epochs");
       if (threshold_it != thresholds.end()) {
         uint64_t threshold = threshold_it->second;
-        if (threshold != std::numeric_limits<uint64_t>::max()) {
+        if (threshold != std::numeric_limits<uint64_t>::min()) {
           // Extract file number from candidate file name
           uint64_t file_number = 0;
           std::string base_name = RemoveEpoch(candidate_file_path);
-          if (ParseFileName(base_name, &file_number, nullptr)) {
+          FileType type;
+          if (ParseFileName(base_name, &file_number, &type)) {
             if (file_number >= threshold) {
-              Log(InfoLogLevel::DEBUG_LEVEL, cfs_->info_log_,
+              Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
                   "[pg] Skipping obsolete file %s due to file number "
                   "threshold (file_num=%llu, threshold=%llu)",
                   candidate_file_path.c_str(),
@@ -500,7 +501,7 @@ class ImprovedPurger {
                   static_cast<unsigned long long>(threshold));
             } else {
               obsolete_files->push_back(candidate_file_path);
-              Log(InfoLogLevel::DEBUG_LEVEL, cfs_->info_log_,
+              Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
                   "[pg] File %s selected for deletion (file_num=%llu, "
                   "threshold=%llu)",
                   candidate_file_path.c_str(),
