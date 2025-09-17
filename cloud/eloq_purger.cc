@@ -218,7 +218,7 @@ Status EloqPurger::ListAllFiles(PurgerAllFiles *all_files) {
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
         "[pg] Failed to list files in destination object path %s: %s",
         object_path_.c_str(), s.ToString().c_str());
-    return s;
+    return Status::IOError(s.ToString());
   }
 
   Log(InfoLogLevel::DEBUG_LEVEL, cfs_->info_log_,
@@ -235,7 +235,7 @@ Status EloqPurger::ListCloudManifests(
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
         "[pg] Failed to list cloud manifest files in bucket %s: %s",
         bucket_name_.c_str(), s.ToString().c_str());
-    return s;
+    return Status::IOError(s.ToString());
   }
 
   Log(InfoLogLevel::DEBUG_LEVEL, cfs_->info_log_,
@@ -259,7 +259,7 @@ Status EloqPurger::LoadCloudManifests(
       Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
           "[pg] Failed to open cloud manifest file %s: %s",
           cloud_manifest_file.c_str(), s.ToString().c_str());
-      return s;
+      return Status::IOError(s.ToString());
     }
 
     std::unique_ptr<CloudManifest> cloud_manifest;
@@ -272,7 +272,7 @@ Status EloqPurger::LoadCloudManifests(
       Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
           "[pg] Failed to load cloud manifest from file %s: %s",
           cloud_manifest_file.c_str(), s.ToString().c_str());
-      return s;
+      return Status::IOError(s.ToString());
     }
 
     Log(InfoLogLevel::DEBUG_LEVEL, cfs_->info_log_,
@@ -310,7 +310,7 @@ Status EloqPurger::CollectLiveFiles(
       Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
           "[pg] Failed to get metadata for manifest file %s: %s",
           manifest_file.c_str(), s.ToString().c_str());
-      return s;
+      return Status::IOError(s.ToString());
     }
 
     (*epoch_manifest_infos)[current_epoch] = manifest_file_info;
@@ -321,7 +321,7 @@ Status EloqPurger::CollectLiveFiles(
       Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
           "[pg] Failed to get live files from cloud manifest file %s: %s",
           cloud_manifest_name.c_str(), s.ToString().c_str());
-      return s;
+      return Status::IOError(s.ToString());
     }
 
     for (uint64_t num : live_file_numbers) {
@@ -417,8 +417,8 @@ void EloqPurger::SelectObsoleteFilesWithThreshold(
       }
     } else {
       Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
-          "[pg] No threshold for epoch %s, using conservative approach - "
-          "not deleting file %s",
+          "[pg] threshold is 0 for epoch %s, purge is blocked intentionally. "
+          "%s is skipped.",
           candidate_epoch.c_str(), candidate_file_path.c_str());
     }
   }
