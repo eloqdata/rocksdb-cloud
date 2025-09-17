@@ -30,12 +30,15 @@ int main() {
 #include <gflags/gflags.h>
 
 #include <chrono>
+#include <algorithm>
+#include <cctype>
 #include <iostream>
 #include <memory>
 #include <regex>
 #include <string>
 
-#include "eloq_purger.h"
+#include "cloud/eloq_purger.h"
+
 #ifndef ROCKSDB_LITE
 #ifdef USE_AWS
 #include <aws/core/Aws.h>
@@ -136,14 +139,18 @@ inline rocksdb::Status NewCloudFileSystem(
     rocksdb::CloudFileSystem **cfs) {
   rocksdb::Status status;
   // Create a cloud file system
-#if USE_AWS
+#if defined(USE_AWS)
   // AWS s3 file system
   status = rocksdb::CloudFileSystemEnv::NewAwsFileSystem(
       rocksdb::FileSystem::Default(), cfs_options, nullptr, cfs);
-#elif USE_GCP
+#elif defined(USE_GCP)
   // Google cloud storage file system
   status = rocksdb::CloudFileSystemEnv::NewGcpFileSystem(
       rocksdb::FileSystem::Default(), cfs_options, nullptr, cfs);
+#else
+  status = rocksdb::Status::NotSupported(
+      "RocksDB Cloud not compiled with AWS or GCP support");
+  *cfs = nullptr;
 #endif
   return status;
 };
@@ -155,6 +162,7 @@ std::string toLower(const std::string &str) {
   return lowerStr;
 }
 
+#ifdef USE_AWS
 rocksdb::S3ClientFactory BuildS3ClientFactory(const std::string &endpoint) {
   return [endpoint](const std::shared_ptr<Aws::Auth::AWSCredentialsProvider>
                         &credentialsProvider,
@@ -185,8 +193,6 @@ rocksdb::S3ClientFactory BuildS3ClientFactory(const std::string &endpoint) {
     } else {
       config.scheme = Aws::Http::Scheme::HTTP;
     }
-    // Disable SSL verification for HTTPS
-    config.verifySSL = false;
 
     // Create and return the S3 client
     if (credentialsProvider) {
@@ -199,6 +205,7 @@ rocksdb::S3ClientFactory BuildS3ClientFactory(const std::string &endpoint) {
     }
   };
 }
+#endif
 
 int main(int argc, char **argv) {
   // Initialize gflags and glog

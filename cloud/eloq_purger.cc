@@ -23,16 +23,18 @@
 #include <gflags/gflags.h>
 
 #include <chrono>
-#include <iostream>
+#include <cassert>
+#include <cstdio>
+#include <fstream>
 #include <limits>
 #include <memory>
-#include <regex>
+#include <sstream>
 #include <set>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
+#include <unistd.h>
 
 #include "cloud/cloud_manifest.h"
 #include "cloud/eloq_purger.h"
@@ -59,10 +61,19 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
   std::string object_key = GetS3ObjectKey();
 
   // Write to temp local file at first
-  std::string time_id = std::to_string(
-      std::chrono::steady_clock::now().time_since_epoch().count());
-  std::string temp_file_path =
-      "/tmp/smallest_file_number_" + epoch_ + "_" + time_id + "_download.txt";
+  char tmp_template[] =
+      "/tmp/smallest_file_number_download_XXXXXX";  // Xs will be replaced
+  int fd = mkstemp(tmp_template);
+  if (fd == -1) {
+    Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+        "Failed to create temp file for reading smallest file number from S3: "
+        "%s, object_key: %s, returning UINT64_MIN",
+        strerror(errno), object_key.c_str());
+    *file_number = std::numeric_limits<uint64_t>::min();
+    return Status::IOError("Failed to create temp file");
+  }
+  close(fd);  // We will open it later for reading
+  std::string temp_file_path = tmp_template;
 
   rocksdb::IOStatus s = cfs_->GetStorageProvider()->GetCloudObject(
       bucket_name_, object_key, temp_file_path);
@@ -379,8 +390,6 @@ void EloqPurger::SelectObsoleteFilesWithThreshold(
 
     // NEW: Check file number threshold
     auto threshold_it = thresholds.find(candidate_epoch);
-    assert(threshold_it != thresholds.end() &&
-           "Thresholds should have been loaded for all epochs");
     if (threshold_it != thresholds.end()) {
       uint64_t threshold = threshold_it->second;
       if (threshold != std::numeric_limits<uint64_t>::min()) {
@@ -389,18 +398,18 @@ void EloqPurger::SelectObsoleteFilesWithThreshold(
         std::string base_name = RemoveEpoch(candidate_file_path);
         FileType type;
         if (ParseFileName(base_name, &file_number, &type)) {
-          if (file_number >= threshold) {
-            Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
-                "[pg] Skipping obsolete file %s due to file number "
-                "threshold (file_num=%llu, threshold=%llu)",
-                candidate_file_path.c_str(),
-                static_cast<unsigned long long>(file_number),
-                static_cast<unsigned long long>(threshold));
-          } else {
+          if (file_number < threshold) {
             obsolete_files->push_back(candidate_file_path);
             Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
                 "[pg] File %s selected for deletion (file_num=%llu, "
                 "threshold=%llu)",
+                candidate_file_path.c_str(),
+                static_cast<unsigned long long>(file_number),
+                static_cast<unsigned long long>(threshold));
+          } else {
+            Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+                "[pg] Skipping obsolete file %s due to file number "
+                "threshold (file_num=%llu, threshold=%llu)",
                 candidate_file_path.c_str(),
                 static_cast<unsigned long long>(file_number),
                 static_cast<unsigned long long>(threshold));
