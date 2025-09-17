@@ -21,20 +21,20 @@
  */
 
 #include <gflags/gflags.h>
+#include <unistd.h>
 
-#include <chrono>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <limits>
 #include <memory>
-#include <sstream>
 #include <set>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
-#include <unistd.h>
 
 #include "cloud/cloud_manifest.h"
 #include "cloud/eloq_purger.h"
@@ -65,9 +65,9 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
       "/tmp/smallest_file_number_download_XXXXXX";  // Xs will be replaced
   int fd = mkstemp(tmp_template);
   if (fd == -1) {
-    Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
         "Failed to create temp file for reading smallest file number from S3: "
-        "%s, object_key: %s, returning UINT64_MIN",
+        "%s, object_key: %s",
         strerror(errno), object_key.c_str());
     *file_number = std::numeric_limits<uint64_t>::min();
     return Status::IOError("Failed to create temp file");
@@ -79,9 +79,8 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
       bucket_name_, object_key, temp_file_path);
 
   if (!s.ok()) {
-    Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
-        "Failed to read smallest file number from S3: %s, object_key: %s, "
-        "returning UINT64_MIN",
+    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+        "Failed to read smallest file number from S3: %s, object_key: %s, ",
         s.ToString().c_str(), object_key.c_str());
     *file_number = std::numeric_limits<uint64_t>::min();
     return s;
@@ -90,9 +89,9 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
   // Read the content of the temp file
   std::ifstream temp_file(temp_file_path);
   if (!temp_file.is_open()) {
-    Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
         "Failed to open temp file for reading smallest file number: %s, "
-        "object_key: %s, returning UINT64_MIN",
+        "object_key: %s",
         temp_file_path.c_str(), object_key.c_str());
     *file_number = std::numeric_limits<uint64_t>::min();
     return Status::IOError("Failed to open temp file");
@@ -115,7 +114,7 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
         static_cast<unsigned long long>(*file_number), object_key.c_str());
     return Status::OK();
   } catch (const std::exception &e) {
-    Log(InfoLogLevel::INFO_LEVEL, nullptr,
+    Log(InfoLogLevel::ERROR_LEVEL, nullptr,
         "Failed to parse smallest file number from S3 content: '%s', "
         "returning UINT64_MIN",
         content.c_str());
