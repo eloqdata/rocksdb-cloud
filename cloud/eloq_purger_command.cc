@@ -52,7 +52,7 @@ int main() {
 class AwsSdkManager {
  public:
   AwsSdkManager() {
-    aws_options_.loggingOptions.logLevel = Aws::Utils::Logging::LogLevel::Info;
+    aws_options_.loggingOptions.logLevel = Aws::Utils::Logging::LogLevel::Debug;
     Aws::InitAPI(aws_options_);
     initialized_ = true;
   }
@@ -79,7 +79,7 @@ class AwsSdkManager {
 DEFINE_string(s3_url, "", "S3 URL in format s3://bucket/path (required)");
 DEFINE_bool(dry_run, false,
             "Dry run mode - list obsolete files but don't delete them");
-DEFINE_string(aws_region, "", "AWS region (default: \"\")");
+DEFINE_string(aws_region, "ap-northeast-1", "AWS region (default: \"\")");
 DEFINE_string(aws_access_key, "", "AWS Access Key ID");
 DEFINE_string(aws_secret_key, "", "AWS Secret Access Key");
 
@@ -243,10 +243,6 @@ int main(int argc, char **argv) {
     ROCKSDB_NAMESPACE::CloudFileSystemOptions cfs_options;
 #ifndef ROCKSDB_LITE
 #ifdef USE_AWS
-    if (!endpoint.empty()) {
-      cfs_options.s3_client_factory = BuildS3ClientFactory(endpoint);
-    }
-
     if (FLAGS_aws_access_key.empty() || FLAGS_aws_secret_key.empty()) {
       std::cout << "No AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY "
                    "provided, use default credential provider"
@@ -264,14 +260,28 @@ int main(int argc, char **argv) {
                 << status.ToString() << std::endl;
       return 1;
     }
+
 #endif
 #endif
     cfs_options.src_bucket.SetBucketName(bucket_name);
+    // Clear prefix to replace the default prefix of "rockset."
+    cfs_options.src_bucket.SetBucketPrefix("");
     cfs_options.src_bucket.SetObjectPath(object_path);
     cfs_options.src_bucket.SetRegion(FLAGS_aws_region);
     cfs_options.dest_bucket.SetBucketName(bucket_name);
+    // Clear prefix to replace the default prefix of "rockset."
+    cfs_options.dest_bucket.SetBucketPrefix("");
     cfs_options.dest_bucket.SetObjectPath(object_path);
     cfs_options.dest_bucket.SetRegion(FLAGS_aws_region);
+
+#ifndef ROCKSDB_LITE
+#ifdef USE_AWS
+    if (!endpoint.empty()) {
+      cfs_options.s3_client_factory = BuildS3ClientFactory(endpoint);
+      cfs_options.use_aws_transfer_manager = false;
+    }
+#endif
+#endif
 
     // Create CloudFileSystem
     rocksdb::CloudFileSystem *cfs;
@@ -295,7 +305,7 @@ int main(int argc, char **argv) {
     }
 
     rocksdb::Options options;
-    s = ROCKSDB_NAMESPACE::CreateLoggerFromOptions("improved_purger", options,
+    s = ROCKSDB_NAMESPACE::CreateLoggerFromOptions("eloq_purger_log", options,
                                                    &options.info_log);
     if (!s.ok()) {
       std::cerr << "Error: Failed to create logger: " << s.ToString()
