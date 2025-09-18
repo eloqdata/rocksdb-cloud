@@ -167,20 +167,21 @@ bool EloqPurger::RunSinglePurgeCycle() {
     return false;
   }
 
-  if (!CollectLiveFiles(state.cloudmanifests, &state.live_file_names,
-                        &state.current_epoch_manifest_files)
-           .ok()) {
-    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
-        "[pg] Failed to collect live files, aborting purge cycle");
-    return false;
-  }
-
   // NEW: Load file number thresholds from S3
+  // before collecting live files
   if (!LoadFileNumberThresholds(state.cloudmanifests,
                                 &state.file_number_thresholds)
            .ok()) {
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
         "[pg] Failed to load file number thresholds, aborting purge cycle");
+    return false;
+  }
+
+  if (!CollectLiveFiles(state.cloudmanifests, &state.live_file_names,
+                        &state.current_epoch_manifest_files)
+           .ok()) {
+    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+        "[pg] Failed to collect live files, aborting purge cycle");
     return false;
   }
 
