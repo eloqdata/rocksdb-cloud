@@ -1338,6 +1338,9 @@ write_stress: $(OBJ_DIR)/tools/write_stress.o $(LIBRARY)
 db_sanity_test: $(OBJ_DIR)/tools/db_sanity_test.o $(LIBRARY)
 	$(AM_LINK)
 
+eloq_purger_command: $(OBJ_DIR)/cloud/eloq_purger_command.o $(LIBRARY)
+	$(AM_LINK)
+
 db_repl_stress: $(OBJ_DIR)/tools/db_repl_stress.o $(LIBRARY)
 	$(AM_LINK)
 
