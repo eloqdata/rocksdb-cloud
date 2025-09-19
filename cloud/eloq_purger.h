@@ -116,12 +116,16 @@ class EloqPurger {
       PurgerCloudManifestMap *manifests);
   Status CollectLiveFiles(const PurgerCloudManifestMap &cloudmanifests,
                           PurgerLiveFileSet *live_files,
-                          PurgerEpochManifestMap *epoch_manifest_infos);
+                          PurgerEpochManifestMap *current_epoch_manifest_infos);
   Status LoadFileNumberThresholds(const PurgerCloudManifestMap &cloudmanifests,
                                   PurgerFileNumberThresholds *thresholds);
-  void SelectObsoleteFilesWithThreshold(
+  void SelectObsoleteSSTFilesWithThreshold(
       const PurgerAllFiles &all_files, const PurgerLiveFileSet &live_files,
       const PurgerFileNumberThresholds &thresholds,
+      std::vector<std::string> *obsolete_files);
+  void SelectObsoleteManifestFiles(
+      const PurgerAllFiles &all_files,
+      const PurgerEpochManifestMap &current_epoch_manifest_infos,
       std::vector<std::string> *obsolete_files);
   void DeleteObsoleteFiles(const std::vector<std::string> &obsolete_files);
 };

@@ -186,9 +186,14 @@ bool EloqPurger::RunSinglePurgeCycle() {
   }
 
   // Enhanced selection with file number checking
-  SelectObsoleteFilesWithThreshold(state.all_files, state.live_file_names,
-                                   state.file_number_thresholds,
-                                   &state.obsolete_files);
+  SelectObsoleteSSTFilesWithThreshold(state.all_files, state.live_file_names,
+                                      state.file_number_thresholds,
+                                      &state.obsolete_files);
+
+  // Select obsolete manifest files
+  SelectObsoleteManifestFiles(state.all_files,
+                              state.current_epoch_manifest_files,
+                              &state.obsolete_files);
 
   if (dry_run_) {
     Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
@@ -288,7 +293,7 @@ Status EloqPurger::LoadCloudManifests(
 
 Status EloqPurger::CollectLiveFiles(
     const PurgerCloudManifestMap &cloudmanifests, PurgerLiveFileSet *live_files,
-    PurgerEpochManifestMap *epoch_manifest_infos) {
+    PurgerEpochManifestMap *current_epoch_manifest_infos) {
   std::unique_ptr<ManifestReader> manifest_reader =
       std::make_unique<ManifestReader>(cfs_->info_log_, cfs_, bucket_name_);
 
@@ -314,7 +319,7 @@ Status EloqPurger::CollectLiveFiles(
       return Status::IOError(s.ToString());
     }
 
-    (*epoch_manifest_infos)[current_epoch] = manifest_file_info;
+    (*current_epoch_manifest_infos)[current_epoch] = manifest_file_info;
 
     s = manifest_reader->GetLiveFiles(object_path_, current_epoch,
                                       &live_file_numbers);
@@ -369,7 +374,7 @@ Status EloqPurger::LoadFileNumberThresholds(
   return Status::OK();
 }
 
-void EloqPurger::SelectObsoleteFilesWithThreshold(
+void EloqPurger::SelectObsoleteSSTFilesWithThreshold(
     const PurgerAllFiles &all_files, const PurgerLiveFileSet &live_files,
     const PurgerFileNumberThresholds &thresholds,
     std::vector<std::string> *obsolete_files) {
@@ -377,7 +382,7 @@ void EloqPurger::SelectObsoleteFilesWithThreshold(
     const std::string &candidate_file_path = candidate.first;
 
     // Skip non-SST files
-    if (!ends_with(RemoveEpoch(candidate_file_path), ".sst")) {
+    if (!IsSstFile(RemoveEpoch(candidate_file_path))) {
       continue;
     }
 
@@ -422,6 +427,33 @@ void EloqPurger::SelectObsoleteFilesWithThreshold(
           "%s is skipped.",
           candidate_epoch.c_str(), candidate_file_path.c_str());
     }
+  }
+}
+
+void EloqPurger::SelectObsoleteManifestFiles(
+    const PurgerAllFiles &all_files,
+    const PurgerEpochManifestMap &current_epoch_manifest_infos,
+    std::vector<std::string> *obsolete_files) {
+  for (const auto &candidate : all_files) {
+    const std::string &candidate_file_path = candidate.first;
+
+    // Skip non-manifest files
+    if (!IsManifestFile(RemoveEpoch(candidate_file_path))) {
+      continue;
+    }
+
+    std::string candidate_epoch = GetEpoch(candidate_file_path);
+
+    // Skip current epoch manifest files
+    auto it = current_epoch_manifest_infos.find(candidate_epoch);
+    if (it != current_epoch_manifest_infos.end()) {
+      continue;
+    }
+
+    obsolete_files->push_back(candidate_file_path);
+    Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+        "[pg] Manifest file %s selected for deletion",
+        candidate_file_path.c_str());
   }
 }
 
