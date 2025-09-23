@@ -26,7 +26,7 @@ LIB_SOURCES =                                                   \
   cloud/cloud_file_system_impl.cc                               \
   cloud/cloud_log_controller.cc                                 \
   cloud/manifest_reader.cc                                      \
-  cloud/single_object_path_purge.cc                             \
+  cloud/eloq_purger.cc                                      \
   cloud/cloud_manifest.cc                                       \
   cloud/cloud_scheduler.cc                                      \
   cloud/cloud_storage_provider.cc                               \
@@ -443,6 +443,9 @@ TOOLS_MAIN_SOURCES =                                                    \
   tools/dump/rocksdb_undump.cc                                          \
   tools/trace_analyzer.cc                                               \
   tools/io_tracer_parser_tool.cc                                        \
+
+ELOQ_PURGER_SOURCES =                                                   \
+  cloud/eloq_purger_command.cc                                          \
 
 BENCH_MAIN_SOURCES =                                                    \
   cache/cache_bench.cc                                                  \

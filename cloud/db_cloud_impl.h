@@ -33,6 +33,8 @@ class DBCloudImpl : public DBCloud {
 
   Status WarmUp(size_t max_warmup_threads) override;
 
+  Status GetCurrentEpoch(std::string *epoch) const override;
+
  protected:
   // The CloudFileSystem used by this open instance.
   CloudFileSystem* cfs_;
