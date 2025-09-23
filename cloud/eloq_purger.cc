@@ -24,8 +24,10 @@
 #include <unistd.h>
 
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>

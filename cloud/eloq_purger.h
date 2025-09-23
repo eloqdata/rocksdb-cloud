@@ -55,7 +55,7 @@ class S3FileNumberReader {
 
   /**
    * @brief Read the smallest file number from S3
-   * @return The smallest file number, or UINT64_MAX if not found
+   * @return The smallest file number, or UINT64_MIN if not found
    */
   Status ReadSmallestFileNumber(uint64_t *file_number);
 
