@@ -201,6 +201,11 @@ bool EloqPurger::RunSinglePurgeCycle() {
                               state.current_epoch_manifest_files,
                               &state.obsolete_files);
 
+  // Select obsolete CLOUDMANIFEST files
+  SelectObsoleteCloudManifetFiles(state.all_files, state.cloudmanifests,
+                                  state.current_epoch_manifest_files,
+                                  &state.obsolete_files);
+
   if (dry_run_) {
     Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
         "[pg] DRY RUN: Would delete %zu files", state.obsolete_files.size());
@@ -460,6 +465,264 @@ void EloqPurger::SelectObsoleteManifestFiles(
     Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
         "[pg] Manifest file %s selected for deletion",
         candidate_file_path.c_str());
+  }
+}
+
+Status EloqPurger::GetS3CurrentTime(uint64_t *current_time) {
+  // Create a temporary local file
+  char tmp_template[] = "/tmp/purger_s3_time_XXXXXX";
+  int fd = mkstemp(tmp_template);
+  if (fd == -1) {
+    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+        "[pg] Failed to create temp file for S3 time check: %s",
+        strerror(errno));
+    return Status::IOError("Failed to create temp file");
+  }
+  
+  std::string temp_local_path = tmp_template;
+  
+  // Write a small amount of data to the file
+  const char *content = "time_check";
+  ssize_t bytes_written = write(fd, content, strlen(content));
+  close(fd);
+  
+  if (bytes_written < 0) {
+    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+        "[pg] Failed to write to temp file for S3 time check: %s",
+        strerror(errno));
+    std::remove(temp_local_path.c_str());
+    return Status::IOError("Failed to write to temp file");
+  }
+  
+  // Extract just the filename from the local path and use it for S3
+  std::string temp_filename = temp_local_path.substr(temp_local_path.find_last_of('/') + 1);
+  std::string temp_s3_path = object_path_ + "/" + temp_filename;
+  
+  // Upload the file to S3
+  IOStatus s = cfs_->GetStorageProvider()->PutCloudObject(
+      temp_local_path, bucket_name_, temp_s3_path);
+  
+  if (!s.ok()) {
+    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+        "[pg] Failed to upload temp file to S3 for time check: %s",
+        s.ToString().c_str());
+    std::remove(temp_local_path.c_str());
+    return Status::IOError(s.ToString());
+  }
+  
+  // Get the metadata to read the timestamp
+  CloudObjectInformation file_info;
+  s = cfs_->GetStorageProvider()->GetCloudObjectMetadata(
+      bucket_name_, temp_s3_path, &file_info);
+  
+  if (!s.ok()) {
+    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+        "[pg] Failed to get metadata for temp file from S3: %s",
+        s.ToString().c_str());
+    // Try to delete the temp file anyway
+    cfs_->GetStorageProvider()->DeleteCloudObject(bucket_name_, temp_s3_path);
+    std::remove(temp_local_path.c_str());
+    return Status::IOError(s.ToString());
+  }
+  
+  *current_time = file_info.modification_time;
+  
+  // Delete the temporary file from S3
+  s = cfs_->GetStorageProvider()->DeleteCloudObject(bucket_name_, temp_s3_path);
+  if (!s.ok()) {
+    Log(InfoLogLevel::WARN_LEVEL, cfs_->info_log_,
+        "[pg] Failed to delete temp file from S3: %s (non-fatal)",
+        s.ToString().c_str());
+  }
+  
+  // Delete the local temporary file
+  if (std::remove(temp_local_path.c_str()) != 0) {
+    Log(InfoLogLevel::WARN_LEVEL, cfs_->info_log_,
+        "[pg] Warning: Failed to remove local temp file %s",
+        temp_local_path.c_str());
+  }
+  
+  Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+      "[pg] Retrieved S3 current time: %llu",
+      static_cast<unsigned long long>(*current_time));
+  
+  return Status::OK();
+}
+
+void EloqPurger::SelectObsoleteCloudManifetFiles(
+    const PurgerAllFiles &all_files,
+    const PurgerCloudManifestMap &cloudmanifests,
+    const PurgerEpochManifestMap &current_epoch_manifest_infos,
+    std::vector<std::string> *obsolete_files) {
+  // Struct to represent CLOUDMANIFEST file information
+  struct CloudManifestFileInfo {
+    uint64_t term;
+    std::string file_path;
+    uint64_t current_manifest_timestamp;
+    std::string epoch;
+    
+    CloudManifestFileInfo(uint64_t t, const std::string& path,
+                          uint64_t manifest_ts, const std::string& ep)
+        : term(t), file_path(path),
+          current_manifest_timestamp(manifest_ts), epoch(ep) {}
+  };
+
+  // Map from postfix to list of CLOUDMANIFEST file info
+  std::unordered_map<std::string, std::vector<CloudManifestFileInfo>> 
+      grouped_manifests;
+
+  const std::string prefix = "CLOUDMANIFEST-";
+  
+  // Parse and group CLOUDMANIFEST files
+  for (const auto &candidate : all_files) {
+    const std::string &candidate_file_path = candidate.first;
+
+    // Check if it's a CLOUDMANIFEST file
+    if (candidate_file_path.find(prefix) != 0) {
+      continue;
+    }
+
+    // Look up in cloudmanifests to get the epoch
+    auto manifest_it = cloudmanifests.find(candidate_file_path);
+    if (manifest_it == cloudmanifests.end()) {
+      Log(InfoLogLevel::DEBUG_LEVEL, cfs_->info_log_,
+          "[pg] Skipping CLOUDMANIFEST file %s (not loaded)",
+          candidate_file_path.c_str());
+      continue;
+    }
+
+    std::string current_epoch = manifest_it->second->GetCurrentEpoch();
+
+    // Look up the current manifest file timestamp for this epoch
+    auto manifest_info_it = current_epoch_manifest_infos.find(current_epoch);
+    if (manifest_info_it == current_epoch_manifest_infos.end()) {
+      Log(InfoLogLevel::WARN_LEVEL, cfs_->info_log_,
+          "[pg] No current manifest info found for epoch %s, skipping CLOUDMANIFEST %s",
+          current_epoch.c_str(), candidate_file_path.c_str());
+      continue;
+    }
+
+    uint64_t current_manifest_timestamp = manifest_info_it->second.modification_time;
+
+    // Extract the part after "CLOUDMANIFEST-"
+    std::string remainder = candidate_file_path.substr(prefix.length());
+    
+    // Find the last dash to separate postfix and term
+    size_t last_dash = remainder.find_last_of('-');
+    
+    std::string postfix;
+    std::string term_str;
+    
+    if (last_dash == std::string::npos) {
+      // Pattern: CLOUDMANIFEST-{term} (no postfix)
+      postfix = "";
+      term_str = remainder;
+    } else {
+      // Pattern: CLOUDMANIFEST-{postfix}-{term}
+      postfix = remainder.substr(0, last_dash);
+      term_str = remainder.substr(last_dash + 1);
+    }
+
+    // Validate that term is a number
+    uint64_t term = 0;
+    try {
+      term = std::stoull(term_str);
+    } catch (const std::exception &e) {
+      // Not a valid pattern, skip this file
+      Log(InfoLogLevel::DEBUG_LEVEL, cfs_->info_log_,
+          "[pg] Skipping CLOUDMANIFEST file %s (invalid term: %s)",
+          candidate_file_path.c_str(), term_str.c_str());
+      continue;
+    }
+
+    // Group by postfix
+    grouped_manifests[postfix].emplace_back(term, candidate_file_path,
+                                            current_manifest_timestamp,
+                                            current_epoch);
+    
+    Log(InfoLogLevel::DEBUG_LEVEL, cfs_->info_log_,
+        "[pg] Found CLOUDMANIFEST file %s with postfix='%s', term=%llu, "
+        "manifest_timestamp=%llu, epoch=%s",
+        candidate_file_path.c_str(), postfix.c_str(),
+        static_cast<unsigned long long>(term),
+        static_cast<unsigned long long>(current_manifest_timestamp),
+        current_epoch.c_str());
+  }
+
+  // Get current timestamp from S3
+  uint64_t current_time = 0;
+  Status time_status = GetS3CurrentTime(&current_time);
+  if (!time_status.ok()) {
+    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+        "[pg] Failed to get S3 current time, aborting CLOUDMANIFEST cleanup: %s",
+        time_status.ToString().c_str());
+    return;
+  }
+  
+  // One hour in seconds
+  const uint64_t one_hour_seconds = 3600;
+
+  // Process each postfix group
+  for (auto &group : grouped_manifests) {
+    const std::string &postfix = group.first;
+    auto &files = group.second;
+
+    if (files.empty()) {
+      continue;
+    }
+
+    // Find the file with the largest term (current CLOUDMANIFEST)
+    auto max_it = std::max_element(files.begin(), files.end(),
+        [](const CloudManifestFileInfo &a, const CloudManifestFileInfo &b) {
+          return a.term < b.term;
+        });
+    
+    uint64_t max_term = max_it->term;
+    
+    Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+        "[pg] CLOUDMANIFEST group postfix='%s': largest term=%llu",
+        postfix.c_str(), static_cast<unsigned long long>(max_term));
+
+    // Check each file in the group
+    for (const auto &file_info : files) {
+      // Keep the file with the largest term (current CLOUDMANIFEST)
+      if (file_info.term == max_term) {
+        Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+            "[pg] Keeping CLOUDMANIFEST file %s (largest term in group)",
+            file_info.file_path.c_str());
+        continue;
+      }
+
+      // Compare current MANIFEST file timestamp with S3 current time
+      // If MANIFEST timestamp is earlier than S3 current time by 1 hour or more, delete the CLOUDMANIFEST
+      if (current_time > file_info.current_manifest_timestamp && 
+          (current_time - file_info.current_manifest_timestamp) >= one_hour_seconds) {
+        obsolete_files->push_back(file_info.file_path);
+        Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+            "[pg] CLOUDMANIFEST file %s selected for deletion "
+            "(term=%llu, manifest_timestamp=%llu, s3_current_time=%llu, "
+            "epoch=%s, time_diff=%llu seconds)",
+            file_info.file_path.c_str(), 
+            static_cast<unsigned long long>(file_info.term),
+            static_cast<unsigned long long>(file_info.current_manifest_timestamp),
+            static_cast<unsigned long long>(current_time),
+            file_info.epoch.c_str(),
+            static_cast<unsigned long long>(current_time - file_info.current_manifest_timestamp));
+      } else {
+        uint64_t time_diff = (current_time > file_info.current_manifest_timestamp) 
+            ? (current_time - file_info.current_manifest_timestamp) : 0;
+        Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+            "[pg] Keeping CLOUDMANIFEST file %s "
+            "(term=%llu, manifest_timestamp=%llu, s3_current_time=%llu, "
+            "epoch=%s, time_diff=%llu seconds < 1 hour)",
+            file_info.file_path.c_str(),
+            static_cast<unsigned long long>(file_info.term),
+            static_cast<unsigned long long>(file_info.current_manifest_timestamp),
+            static_cast<unsigned long long>(current_time),
+            file_info.epoch.c_str(),
+            static_cast<unsigned long long>(time_diff));
+      }
+    }
   }
 }
 

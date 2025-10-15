@@ -127,6 +127,12 @@ class EloqPurger {
       const PurgerAllFiles &all_files,
       const PurgerEpochManifestMap &current_epoch_manifest_infos,
       std::vector<std::string> *obsolete_files);
+  void SelectObsoleteCloudManifetFiles(
+      const PurgerAllFiles &all_files,
+      const PurgerCloudManifestMap &cloudmanifests,
+      const PurgerEpochManifestMap &current_epoch_manifest_infos,
+      std::vector<std::string> *obsolete_files);
+  Status GetS3CurrentTime(uint64_t *current_time);
   void DeleteObsoleteFiles(const std::vector<std::string> &obsolete_files);
 };
 
