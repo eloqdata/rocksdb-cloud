@@ -129,7 +129,7 @@ class EloqPurger {
       const PurgerAllFiles &all_files,
       const PurgerEpochManifestMap &current_epoch_manifest_infos,
       std::vector<std::string> *obsolete_files);
-  void SelectObsoleteCloudManifetFiles(
+  void SelectObsoleteCloudManifestFiles(
       const PurgerAllFiles &all_files,
       const PurgerCloudManifestMap &cloudmanifests,
       const PurgerEpochManifestMap &current_epoch_manifest_infos,
