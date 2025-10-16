@@ -82,7 +82,7 @@ class AwsSdkManager {
 DEFINE_string(s3_url, "", "S3 URL in format s3://bucket/path (required)");
 DEFINE_bool(dry_run, false,
             "Dry run mode - list obsolete files but don't delete them");
-DEFINE_string(aws_region, "ap-northeast-1", "AWS region (default: \"\")");
+DEFINE_string(aws_region, "ap-northeast-1", "AWS region (default: \"ap-northeast-1\")");
 DEFINE_string(aws_access_key, "", "AWS Access Key ID");
 DEFINE_string(aws_secret_key, "", "AWS Secret Access Key");
 DEFINE_uint64(cloudmanifest_retention_ms, 3600 * 1000,
