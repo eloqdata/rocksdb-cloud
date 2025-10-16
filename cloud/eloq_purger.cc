@@ -141,11 +141,13 @@ std::string S3FileNumberReader::GetS3ObjectKey() const {
 }
 
 EloqPurger::EloqPurger(CloudFileSystemImpl *cfs, const std::string &bucket_name,
-                       const std::string &object_path, bool dry_run)
+                       const std::string &object_path, bool dry_run,
+                       uint64_t cloudmanifest_retention_ms)
     : cfs_(cfs),
       bucket_name_(bucket_name),
       object_path_(object_path),
-      dry_run_(dry_run) {}
+      dry_run_(dry_run),
+      cloudmanifest_retention_ms_(cloudmanifest_retention_ms) {}
 
 bool EloqPurger::RunSinglePurgeCycle() {
   PurgerCycleState state;
@@ -154,12 +156,16 @@ bool EloqPurger::RunSinglePurgeCycle() {
       "[pg] Starting purge cycle for %s/%s", bucket_name_.c_str(),
       object_path_.c_str());
 
+  // list all files in the object path, for fetch all obsolete files and live files
   if (!ListAllFiles(&state.all_files).ok()) {
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
         "[pg] Failed to list all files, aborting purge cycle");
     return false;
   }
 
+  // list all cloud manifests in the object path
+  // it's safe to purge the obsolete files that are get by above step
+  // any new files generated after above step fetching will be kept
   if (!ListCloudManifests(&state.cloud_manifest_files).ok()) {
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
         "[pg] Failed to list cloud manifests, aborting purge cycle");
@@ -659,8 +665,8 @@ void EloqPurger::SelectObsoleteCloudManifetFiles(
     return;
   }
 
-  // One hour in seconds
-  const uint64_t one_hour_millseconds = 3600 * 1000;
+  // Use configurable retention time (in milliseconds)
+  const uint64_t retention_threshold_ms = cloudmanifest_retention_ms_;
 
   // Process each postfix group
   for (auto &group : grouped_manifests) {
@@ -694,14 +700,14 @@ void EloqPurger::SelectObsoleteCloudManifetFiles(
       }
 
       // Compare current MANIFEST file timestamp with S3 current time
-      // If MANIFEST timestamp is earlier than S3 current time by 1 hour or more, delete the CLOUDMANIFEST
+      // If MANIFEST timestamp is earlier than S3 current time by the retention threshold or more, delete the CLOUDMANIFEST
       if (current_time > file_info.current_manifest_timestamp &&
-          (current_time - file_info.current_manifest_timestamp) >= one_hour_millseconds) {
+          (current_time - file_info.current_manifest_timestamp) >= retention_threshold_ms) {
         obsolete_files->push_back(file_info.file_path);
         Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
             "[pg] CLOUDMANIFEST file %s selected for deletion "
             "(term=%llu, manifest_timestamp=%llu, s3_current_time=%llu, "
-            "epoch=%s, time_diff=%llu seconds)",
+            "epoch=%s, time_diff=%llu ms)",
             file_info.file_path.c_str(),
             static_cast<unsigned long long>(file_info.term),
             static_cast<unsigned long long>(file_info.current_manifest_timestamp),
@@ -714,13 +720,14 @@ void EloqPurger::SelectObsoleteCloudManifetFiles(
         Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
             "[pg] Keeping CLOUDMANIFEST file %s "
             "(term=%llu, manifest_timestamp=%llu, s3_current_time=%llu, "
-            "epoch=%s, time_diff=%llu seconds < 1 hour)",
+            "epoch=%s, time_diff=%llu ms < retention threshold %llu ms)",
             file_info.file_path.c_str(),
             static_cast<unsigned long long>(file_info.term),
             static_cast<unsigned long long>(file_info.current_manifest_timestamp),
             static_cast<unsigned long long>(current_time),
             file_info.epoch.c_str(),
-            static_cast<unsigned long long>(time_diff));
+            static_cast<unsigned long long>(time_diff),
+            static_cast<unsigned long long>(retention_threshold_ms));
       }
     }
   }
