@@ -96,7 +96,8 @@ class EloqPurger {
   };
 
   EloqPurger(CloudFileSystemImpl *cfs, const std::string &bucket_name,
-                 const std::string &object_path, bool dry_run);
+                 const std::string &object_path, bool dry_run,
+                 uint64_t cloudmanifest_retention_ms = 3600 * 1000);
 
   /**
    * @brief Run a single purge cycle with improved file number checking
@@ -108,6 +109,7 @@ class EloqPurger {
   std::string bucket_name_;
   std::string object_path_;
   bool dry_run_;
+  uint64_t cloudmanifest_retention_ms_;
 
   Status ListAllFiles(PurgerAllFiles *all_files);
   Status ListCloudManifests(std::vector<std::string> *cloud_manifest_files);
@@ -127,6 +129,12 @@ class EloqPurger {
       const PurgerAllFiles &all_files,
       const PurgerEpochManifestMap &current_epoch_manifest_infos,
       std::vector<std::string> *obsolete_files);
+  void SelectObsoleteCloudManifestFiles(
+      const PurgerAllFiles &all_files,
+      const PurgerCloudManifestMap &cloudmanifests,
+      const PurgerEpochManifestMap &current_epoch_manifest_infos,
+      std::vector<std::string> *obsolete_files);
+  Status GetS3CurrentTime(uint64_t *current_time);
   void DeleteObsoleteFiles(const std::vector<std::string> &obsolete_files);
 };
 

@@ -82,9 +82,12 @@ class AwsSdkManager {
 DEFINE_string(s3_url, "", "S3 URL in format s3://bucket/path (required)");
 DEFINE_bool(dry_run, false,
             "Dry run mode - list obsolete files but don't delete them");
-DEFINE_string(aws_region, "ap-northeast-1", "AWS region (default: \"\")");
+DEFINE_string(aws_region, "ap-northeast-1", "AWS region (default: \"ap-northeast-1\")");
 DEFINE_string(aws_access_key, "", "AWS Access Key ID");
 DEFINE_string(aws_secret_key, "", "AWS Secret Access Key");
+DEFINE_uint64(cloudmanifest_retention_ms, 3600 * 1000,
+              "Time threshold in milliseconds for CLOUDMANIFEST file retention "
+              "(default: 3600000 ms = 1 hour)");
 
 /**
  * @brief Parse URL into bucket and object path components
@@ -216,9 +219,10 @@ int main(int argc, char **argv) {
     std::cerr << "Usage: " << argv[0]
               << " --s3_url=s3://bucket/path [options]\n";
     std::cerr << "Options:\n";
-    std::cerr << "  --dry_run=false                 Dry run mode - don't "
+    std::cerr << "  --dry_run=false                        Dry run mode - don't "
                  "actually delete files\n";
-    std::cerr << "  --aws_region=us-west-2          AWS region\n";
+    std::cerr << "  --aws_region=ap-northeast-1            AWS region\n";
+    std::cerr << "  --cloudmanifest_retention_ms=3600000   CLOUDMANIFEST retention time in milliseconds\n";
     return 1;
   }
 
@@ -323,7 +327,8 @@ int main(int argc, char **argv) {
 
     // Create and run improved purger
     ROCKSDB_NAMESPACE::EloqPurger purger(cfs_impl, bucket_name, object_path,
-                                         FLAGS_dry_run);
+                                         FLAGS_dry_run,
+                                         FLAGS_cloudmanifest_retention_ms);
 
     if (!ROCKSDB_NAMESPACE::PrerequisitesMet(*cfs_impl)) {
       std::cerr << "Error: Prerequisites for purger not met" << std::endl;
