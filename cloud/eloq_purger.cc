@@ -65,7 +65,7 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
 
   // Write to temp local file at first
   char tmp_template[] =
-      "./smallest_file_number_download_XXXXXX";  // Xs will be replaced
+      "/tmp/smallest_file_number_download_XXXXXX";  // Xs will be replaced
   int fd = mkstemp(tmp_template);
   if (fd == -1) {
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
