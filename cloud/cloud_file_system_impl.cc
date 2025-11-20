@@ -1205,13 +1205,15 @@ IOStatus CloudFileSystemImpl::NeedsReinitialization(
   }
 
   // Check if CLOUDMANIFEST file exists
-  st = base_fs->FileExists(CloudManifestFile(local_dir), io_opts, dbg);
-  if (!st.ok()) {
-    Log(InfoLogLevel::INFO_LEVEL, info_log_,
-        "[cloud_fs_impl] NeedsReinitialization: "
-        "failed to find CLOUDMANIFEST file %s: %s",
-        CloudManifestFile(local_dir).c_str(), st.ToString().c_str());
-    return st.IsNotFound() ? IOStatus::OK() : st;
+  if (!cloud_fs_options.resync_on_open) {
+    st = base_fs->FileExists(CloudManifestFile(local_dir), io_opts, dbg);
+    if (!st.ok()) {
+      Log(InfoLogLevel::INFO_LEVEL, info_log_,
+          "[cloud_fs_impl] NeedsReinitialization: "
+          "failed to find CLOUDMANIFEST file %s: %s",
+          CloudManifestFile(local_dir).c_str(), st.ToString().c_str());
+      return st.IsNotFound() ? IOStatus::OK() : st;
+    }
   }
 
   if (cloud_fs_options.skip_dbid_verification) {
