@@ -91,6 +91,30 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
         "Failed to read smallest file number from S3: %s, object_key: %s, ",
         s.ToString().c_str(), object_key.c_str());
+    // For snapshots and branching, the smallest file number object might not
+    // exist yet. In that case, we read the max file number from the MANIFEST
+    // file as the smallest file number.
+    uint64_t manifest_max_file_number = 0;
+    const std::string manifest_file_name = ManifestFileWithEpoch(epoch_);
+    Status status = ManifestReader::GetMaxFileNumberFromManifest(
+        cfs_, manifest_file_name, &manifest_max_file_number);
+    if (status.ok()) {
+      if (manifest_max_file_number > 0) {
+        manifest_max_file_number -= 1;
+      }
+      *file_number = manifest_max_file_number;
+      Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+          "Using max file number from MANIFEST as smallest file number: %llu, "
+          "object_key: %s",
+          static_cast<unsigned long long>(*file_number), object_key.c_str());
+      return Status::OK();
+    } else {
+      Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+          "Failed to read max file number from MANIFEST: %s, returning "
+          "UINT64_MIN",
+          status.ToString().c_str());
+    }
+
     *file_number = std::numeric_limits<uint64_t>::min();
     if (s.IsNotFound()) {
       return Status::NotFound("Smallest file number object not found");
