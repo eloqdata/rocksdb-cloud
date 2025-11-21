@@ -104,7 +104,8 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
       }
       *file_number = manifest_max_file_number;
       Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
-          "Using max file number from MANIFEST as smallest file number: %llu, "
+          "Using max file number - 1 from MANIFEST as smallest file number: "
+          "%llu, "
           "object_key: %s",
           static_cast<unsigned long long>(*file_number), object_key.c_str());
       return Status::OK();
