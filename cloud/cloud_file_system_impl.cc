@@ -1,8 +1,6 @@
 // Copyright (c) 2017 Rockset.
 #ifndef ROCKSDB_LITE
 
-#include "rocksdb/cloud/cloud_file_system_impl.h"
-
 #include <cinttypes>
 #include <memory>
 #include <string>
@@ -18,6 +16,7 @@
 #include "file/writable_file_writer.h"
 #include "port/port_posix.h"
 #include "rocksdb/cloud/cloud_file_deletion_scheduler.h"
+#include "rocksdb/cloud/cloud_file_system_impl.h"
 #include "rocksdb/cloud/cloud_log_controller.h"
 #include "rocksdb/cloud/cloud_storage_provider.h"
 #include "rocksdb/db.h"
@@ -48,7 +47,8 @@ CloudFileSystemImpl::CloudFileSystemImpl(
 
 CloudFileSystemImpl::~CloudFileSystemImpl() {
   Log(InfoLogLevel::INFO_LEVEL, info_log_,
-      "[%s] CloudFileSystemImpl::~CloudFileSystemImpl: Destroying CloudFileSystemImpl",
+      "[%s] CloudFileSystemImpl::~CloudFileSystemImpl: Destroying "
+      "CloudFileSystemImpl",
       Name());
   if (cloud_fs_options.cloud_log_controller) {
     cloud_fs_options.cloud_log_controller->StopTailingStream();
@@ -61,19 +61,23 @@ CloudFileSystemImpl::~CloudFileSystemImpl() {
   // we need to ensure that the jobs are cancelled before the destruction
   // of this object.
   Log(InfoLogLevel::INFO_LEVEL, info_log_,
-      "[%s] CloudFileSystemImpl::~CloudFileSystemImpl: Cancelling all scheduled "
+      "[%s] CloudFileSystemImpl::~CloudFileSystemImpl: Cancelling all "
+      "scheduled "
       "file deletions, cloud_file_deletion_scheduler_: %p, size: %zu",
-      Name(), (void *)cloud_file_deletion_scheduler_.get(), cloud_file_deletion_scheduler_.use_count());
+      Name(), (void*)cloud_file_deletion_scheduler_.get(),
+      cloud_file_deletion_scheduler_.use_count());
   if (cloud_file_deletion_scheduler_) {
     // Cancel all scheduled jobs before destruction
-    // otherwise, the jobs will be executed after the destruction of the cfs object,
-    // which can cause a crash.
+    // otherwise, the jobs will be executed after the destruction of the cfs
+    // object, which can cause a crash.
     cloud_file_deletion_scheduler_->CancelAllJobs();
     cloud_file_deletion_scheduler_.reset();
   }
   cloud_fs_options.storage_provider.reset();
   Log(InfoLogLevel::INFO_LEVEL, info_log_,
-      "[%s] CloudFileSystemImpl::~CloudFileSystemImpl: Destroyed CloudFileSystemImpl", Name());
+      "[%s] CloudFileSystemImpl::~CloudFileSystemImpl: Destroyed "
+      "CloudFileSystemImpl",
+      Name());
   LogFlush(info_log_);
 }
 
@@ -273,7 +277,7 @@ IOStatus CloudFileSystemImpl::NewRandomAccessFile(
   const IOOptions io_opts;
   if (sstfile || manifest || identity) {
     if (cloud_fs_options.keep_local_sst_files ||
-        cloud_fs_options.hasSstFileCache()  || !sstfile) {
+        cloud_fs_options.hasSstFileCache() || !sstfile) {
       // Read from local storage and then from cloud storage.
       st = base_fs_->NewRandomAccessFile(fname, file_opts, result, dbg);
 
@@ -782,7 +786,8 @@ IOStatus CloudFileSystemImpl::DeleteFile(const std::string& logical_fname,
   IOStatus st;
   // Delete from destination bucket and local dir
   if (sstfile || manifest || identity) {
-    if (HasDestBucket()) {
+    if (HasDestBucket() &&
+        cloud_fs_options.disable_cloud_file_deletion == false) {
       // add the remote file deletion to the queue
       st = DeleteCloudFileFromDest(basename(fname));
     }
@@ -914,8 +919,7 @@ IOStatus CloudFileSystemImpl::LoadLocalCloudManifest(
 }
 
 std::string CloudFileSystemImpl::RemapFilenameWithCloudManifest(
-                                 const std::string& logical_path,
-                                 CloudManifest* cloud_manifest) const {
+    const std::string& logical_path, CloudManifest* cloud_manifest) const {
   auto file_name = basename(logical_path);
   uint64_t fileNumber;
   FileType type;
@@ -2028,7 +2032,7 @@ IOStatus CloudFileSystemImpl::RollNewEpoch(const std::string& local_dbname) {
 }
 
 IOStatus CloudFileSystemImpl::RollNewBranch(const std::string& local_dbname,
-    const std::string& branch_cookie) {
+                                            const std::string& branch_cookie) {
   uint64_t maxFileNumber;
   auto st = ManifestReader::GetMaxFileNumberFromManifest(
       this, local_dbname + "/MANIFEST-000001", &maxFileNumber);
@@ -2309,8 +2313,7 @@ Status CloudFileSystemImpl::PrepareOptions(const ConfigOptions& options) {
   }
   // start the purge thread only if there is a destination bucket
   // and run_purger is true and purge_thread_ is not already running
-  if (cloud_fs_options.dest_bucket.IsValid() &&
-      cloud_fs_options.run_purger &&
+  if (cloud_fs_options.dest_bucket.IsValid() && cloud_fs_options.run_purger &&
       !purge_thread_.joinable()) {
     CloudFileSystemImpl* cloud = this;
     purge_thread_ = std::thread([cloud] { cloud->Purger(); });
@@ -2378,8 +2381,7 @@ IOStatus CloudFileSystemImpl::FindAllLiveFiles(
 
   // filename will be remapped correctly based on current_epoch of
   // cloud_manifest
-  *manifest_file =
-      RemapFilename(ManifestFileWithEpoch("" /* epoch */));
+  *manifest_file = RemapFilename(ManifestFileWithEpoch("" /* epoch */));
 
   RemapFileNumbers(file_nums, live_sst_files);
 
@@ -2409,7 +2411,8 @@ std::string CloudFileSystemImpl::CloudManifestFile(const std::string& dbname) {
   return MakeCloudManifestFile(dbname, cloud_fs_options.cookie_on_open);
 }
 
-IOStatus CloudFileSystemImpl::BackupCloudManifest(const std::string& dest_folder, std::vector<std::string> &backup_files) {
+IOStatus CloudFileSystemImpl::BackupCloudManifest(
+    const std::string& dest_folder, std::vector<std::string>& backup_files) {
   if (!HasDestBucket()) {
     return IOStatus::InvalidArgument(
         "Dest bucket has to be specified when backing up manifest files");
@@ -2431,13 +2434,15 @@ IOStatus CloudFileSystemImpl::BackupCloudManifest(const std::string& dest_folder
 
   Log(InfoLogLevel::INFO_LEVEL, info_log_,
       "[cloud_fs_impl] Backing up CloudManifest from %s to %s, bucket %s",
-      cloud_manifest_src.c_str(), cloud_manifest_dest.c_str(), GetDestBucketName().c_str());
+      cloud_manifest_src.c_str(), cloud_manifest_dest.c_str(),
+      GetDestBucketName().c_str());
   auto st = GetStorageProvider()->CopyCloudObject(
-      GetDestBucketName(), cloud_manifest_src,
-      GetDestBucketName(), cloud_manifest_dest);
+      GetDestBucketName(), cloud_manifest_src, GetDestBucketName(),
+      cloud_manifest_dest);
   if (!st.ok()) {
     Log(InfoLogLevel::ERROR_LEVEL, info_log_,
-        "[cloud_fs_impl] Failed to copy CloudManifest to backup location %s: %s",
+        "[cloud_fs_impl] Failed to copy CloudManifest to backup location %s: "
+        "%s",
         cloud_manifest_dest.c_str(), st.ToString().c_str());
     return st;
   }
@@ -2451,8 +2456,7 @@ IOStatus CloudFileSystemImpl::BackupCloudManifest(const std::string& dest_folder
     std::string manifest_dest = ManifestFileWithEpoch(dest_path, epoch);
 
     st = GetStorageProvider()->CopyCloudObject(
-        GetDestBucketName(), manifest_src,
-        GetDestBucketName(), manifest_dest);
+        GetDestBucketName(), manifest_src, GetDestBucketName(), manifest_dest);
     if (!st.ok()) {
       Log(InfoLogLevel::ERROR_LEVEL, info_log_,
           "[cloud_fs_impl] Failed to copy manifest for epoch %s to %s: %s",
@@ -2463,7 +2467,8 @@ IOStatus CloudFileSystemImpl::BackupCloudManifest(const std::string& dest_folder
   }
 
   Log(InfoLogLevel::INFO_LEVEL, info_log_,
-      "[cloud_fs_impl] Successfully backed up CloudManifest and %zu manifest files to %s",
+      "[cloud_fs_impl] Successfully backed up CloudManifest and %zu manifest "
+      "files to %s",
       epochs.size(), dest_path.c_str());
   return IOStatus::OK();
 }
