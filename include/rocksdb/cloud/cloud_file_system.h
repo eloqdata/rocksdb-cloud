@@ -442,6 +442,10 @@ class CloudFileSystemOptions {
   // Default: 1 hour
   std::optional<std::chrono::seconds> cloud_file_deletion_delay;
 
+  // Disable cloud file deletion, the cloud files deletion will be dedicated to purger
+  // Default: false
+  bool disable_cloud_file_deletion;
+
   // Type info map for this class.
   static const std::unordered_map<std::string, OptionTypeInfo>
       cloud_fs_option_type_info;
@@ -465,7 +469,8 @@ class CloudFileSystemOptions {
       bool _roll_cloud_manifest_on_open = true,
       std::string _cookie_on_open = "", std::string _new_cookie_on_open = "",
       bool _delete_cloud_invisible_files_on_open = true,
-      std::chrono::seconds _cloud_file_deletion_delay = std::chrono::hours(1))
+      std::chrono::seconds _cloud_file_deletion_delay = std::chrono::hours(1),
+      bool _disable_cloud_file_deletion = false)
       : log_type(_log_type),
         keep_local_sst_files(_keep_local_sst_files),
         keep_local_log_files(_keep_local_log_files),
@@ -491,7 +496,8 @@ class CloudFileSystemOptions {
         new_cookie_on_open(_new_cookie_on_open),
         delete_cloud_invisible_files_on_open(
             _delete_cloud_invisible_files_on_open),
-        cloud_file_deletion_delay(_cloud_file_deletion_delay) {
+        cloud_file_deletion_delay(_cloud_file_deletion_delay),
+        disable_cloud_file_deletion(_disable_cloud_file_deletion) {
     (void)_cloud_type;
   }
 
