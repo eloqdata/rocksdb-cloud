@@ -982,6 +982,7 @@ Status FlushJob::WriteLevel0Table() {
       const SequenceNumber job_snapshot_seq =
           job_context_->GetJobSnapshotSequence();
 
+      const uint64_t build_table_start_micros = clock_->NowMicros();
       s = BuildTable(
           dbname_, versions_, db_options_, tboptions, file_options_,
           cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
@@ -993,6 +994,11 @@ Status FlushJob::WriteLevel0Table() {
           event_logger_, job_context_->job_id, &table_properties_, write_hint,
           full_history_ts_low, blob_callback_, base_, &num_input_entries,
           &memtable_payload_bytes, &memtable_garbage_bytes);
+      const uint64_t build_table_end_micros = clock_->NowMicros();
+      ROCKS_LOG_INFO(db_options_.info_log,
+                     "[%s] [JOB %d] BuildTable took %" PRIu64 " microseconds",
+                     cfd_->GetName().c_str(), job_context_->job_id,
+                     build_table_end_micros - build_table_start_micros);
       TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table:s", &s);
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
@@ -1032,7 +1038,13 @@ Status FlushJob::WriteLevel0Table() {
           DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
     }
     TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table", &mems_);
+    const uint64_t lock_wait_start_micros = clock_->NowMicros();
     db_mutex_->Lock();
+    const uint64_t lock_wait_end_micros = clock_->NowMicros();
+    ROCKS_LOG_INFO(db_options_.info_log,
+                   "[%s] [JOB %d] Lock wait took %" PRIu64 " microseconds",
+                   cfd_->GetName().c_str(), job_context_->job_id,
+                   lock_wait_end_micros - lock_wait_start_micros);
   }
   base_->Unref();
 
