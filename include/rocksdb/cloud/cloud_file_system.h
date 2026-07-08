@@ -446,6 +446,29 @@ class CloudFileSystemOptions {
   // Default: false
   bool disable_cloud_file_deletion;
 
+  // Publish the per-epoch smallest_new_file_number-<epoch> guard object that
+  // protects in-flight flush/compaction uploads from the standalone purger
+  // (see cloud/eloq_purger.cc). When enabled, DBCloud::Open registers an
+  // event listener that tracks in-flight jobs and publishes the low
+  // watermark, and writes a 0 sentinel ("purging blocked") for the epoch
+  // before recovery can flush.
+  //
+  // Enable this on writer nodes in deployments where cloud file deletion is
+  // delegated to the purger (i.e. disable_cloud_file_deletion=true and a
+  // purger runs against the bucket). Default false: no guard is published,
+  // matching the behavior before this option existed (external embedders may
+  // publish the guard themselves).
+  bool publish_file_number_guard{false};
+
+  // Interval of the periodic (upward) publish of the file number guard.
+  // Default: 30 seconds.
+  std::chrono::milliseconds guard_publish_interval{std::chrono::seconds(30)};
+
+  // How long a completed job's entry keeps holding the guard down before it
+  // expires, giving the job's MANIFEST update time to reach the cloud.
+  // Default: 15 seconds.
+  std::chrono::milliseconds guard_entry_duration{std::chrono::seconds(15)};
+
   // Type info map for this class.
   static const std::unordered_map<std::string, OptionTypeInfo>
       cloud_fs_option_type_info;
@@ -703,6 +726,16 @@ class CloudFileSystem : public FileSystem {
   // REQUIRES: CloudManifest loaded
   // REQUIRES: stop writes, stop compactions
   virtual IOStatus BackupCloudManifest(const std::string& dest_folder, std::vector<std::string> &backup_files) = 0;
+
+  // Publishes the 0 sentinel for the current epoch's
+  // smallest_new_file_number guard object, blocking the standalone purger
+  // for this epoch until the next periodic publish. Embedding storage layers
+  // call this around leader transfer.
+  //
+  // REQUIRES: CloudManifest loaded
+  virtual Status BlockPurger() {
+    return Status::NotSupported("BlockPurger not supported");
+  }
 
   virtual Logger* GetLogger() const = 0;
   virtual void SetLogger(std::shared_ptr<Logger>) = 0;

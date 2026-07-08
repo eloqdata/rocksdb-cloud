@@ -88,6 +88,14 @@ DEFINE_string(aws_secret_key, "", "AWS Secret Access Key");
 DEFINE_uint64(cloudmanifest_retention_ms, 3600 * 1000,
               "Time threshold in milliseconds for CLOUDMANIFEST file retention "
               "(default: 3600000 ms = 1 hour)");
+DEFINE_uint64(dead_epoch_file_age_ms, 3600 * 1000,
+              "Minimum S3 object age in milliseconds before a non-live file "
+              "in a dead epoch (an epoch no CLOUDMANIFEST claims as current) "
+              "is deleted (default: 3600000 ms = 1 hour)");
+DEFINE_uint64(max_deletions_per_cycle, 10000,
+              "Maximum number of objects deleted per purge cycle; the "
+              "remainder is re-selected next cycle. 0 means unlimited "
+              "(default: 10000)");
 
 /**
  * @brief Parse URL into bucket and object path components
@@ -328,7 +336,9 @@ int main(int argc, char **argv) {
     // Create and run improved purger
     ROCKSDB_NAMESPACE::EloqPurger purger(cfs_impl, bucket_name, object_path,
                                          FLAGS_dry_run,
-                                         FLAGS_cloudmanifest_retention_ms);
+                                         FLAGS_cloudmanifest_retention_ms,
+                                         FLAGS_dead_epoch_file_age_ms,
+                                         FLAGS_max_deletions_per_cycle);
 
     if (!ROCKSDB_NAMESPACE::PrerequisitesMet(*cfs_impl)) {
       std::cerr << "Error: Prerequisites for purger not met" << std::endl;

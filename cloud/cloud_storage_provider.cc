@@ -266,6 +266,26 @@ IOStatus CloudStorageWritableFileImpl::Sync(const IOOptions& opts,
 
 CloudStorageProvider::~CloudStorageProvider() {}
 
+IOStatus CloudStorageProvider::DeleteCloudObjects(
+    const std::string& bucket_name,
+    const std::vector<std::string>& object_paths, size_t* deleted_count,
+    size_t* failed_count) {
+  assert(deleted_count != nullptr && failed_count != nullptr);
+  IOStatus first_error;
+  for (const auto& object_path : object_paths) {
+    auto st = DeleteCloudObject(bucket_name, object_path);
+    if (st.ok() || st.IsNotFound()) {
+      ++(*deleted_count);
+    } else {
+      ++(*failed_count);
+      if (first_error.ok()) {
+        first_error = st;
+      }
+    }
+  }
+  return first_error;
+}
+
 Status CloudStorageProvider::CreateFromString(
     const ConfigOptions& /*config_options*/, const std::string& id,
     std::shared_ptr<CloudStorageProvider>* provider) {

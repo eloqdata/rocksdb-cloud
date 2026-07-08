@@ -12,6 +12,7 @@
 #include "cache/lru_cache.h"
 #include "cloud/cloud_manifest.h"
 #include "cloud/db_cloud_impl.h"
+#include "cloud/file_number_guard.h"
 #include "cloud/filename.h"
 #include "cloud/manifest_reader.h"
 #include "env/composite_env_wrapper.h"
@@ -171,6 +172,36 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
     if (!st.ok()) {
       return st;
     }
+  }
+
+  // Set up the smallest_new_file_number guard for this epoch. This must
+  // happen after the CLOUDMANIFEST for the epoch is established (so the
+  // epoch is known) and before DB::Open (so recovery-time flushes are
+  // covered by both the sentinel and the listener).
+  if (!read_only && cfs->HasDestBucket() &&
+      cfs->GetCloudFileSystemOptions().publish_file_number_guard) {
+    auto* cfs_impl = dynamic_cast<CloudFileSystemImpl*>(cfs);
+    if (cfs_impl == nullptr) {
+      return Status::InvalidArgument(
+          "publish_file_number_guard requires CloudFileSystemImpl");
+    }
+    auto publisher = std::make_shared<FileNumberGuardPublisher>(
+        cfs_impl, cfs->GetCloudFileSystemOptions().guard_publish_interval,
+        cfs->GetCloudFileSystemOptions().guard_entry_duration);
+    // Sentinel 0: block the purger for this epoch until the first real
+    // publish. If this PUT fails the epoch would be unprotected, so fail
+    // the open (opening already requires cloud connectivity anyway).
+    st = publisher->BlockPurger();
+    if (!st.ok()) {
+      Log(InfoLogLevel::ERROR_LEVEL, options.info_log,
+          "Failed to publish file number guard sentinel: %s",
+          st.ToString().c_str());
+      return st;
+    }
+    publisher->Start();
+    options.listeners.push_back(
+        std::make_shared<FileNumberGuardListener>(publisher));
+    cfs_impl->SetFileNumberGuardPublisher(std::move(publisher));
   }
 
   // Local environment, to be owned by DBCloudImpl, so that it outlives the

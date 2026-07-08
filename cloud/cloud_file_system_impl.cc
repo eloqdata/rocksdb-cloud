@@ -53,6 +53,9 @@ CloudFileSystemImpl::~CloudFileSystemImpl() {
   if (cloud_fs_options.cloud_log_controller) {
     cloud_fs_options.cloud_log_controller->StopTailingStream();
   }
+  // Cancel the file number guard's scheduled publish before the members its
+  // callback reaches through (storage provider, cloud manifest) go away.
+  StopFileNumberGuard();
   StopPurger();
   FileCachePurge();
   cloud_fs_options.cloud_log_controller.reset();

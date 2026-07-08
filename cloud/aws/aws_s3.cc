@@ -18,9 +18,13 @@
 #include <aws/s3/model/CreateBucketConfiguration.h>
 #include <aws/s3/model/CreateBucketRequest.h>
 #include <aws/s3/model/CreateBucketResult.h>
+#include <aws/s3/model/Delete.h>
 #include <aws/s3/model/DeleteBucketRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/s3/model/DeleteObjectResult.h>
+#include <aws/s3/model/DeleteObjectsRequest.h>
+#include <aws/s3/model/DeleteObjectsResult.h>
+#include <aws/s3/model/ObjectIdentifier.h>
 #include <aws/s3/model/GetBucketVersioningRequest.h>
 #include <aws/s3/model/GetBucketVersioningResult.h>
 #include <aws/s3/model/GetObjectRequest.h>
@@ -180,6 +184,15 @@ class AwsS3ClientWrapper {
     CloudRequestCallbackGuard t(cloud_request_callback_.get(),
                                 CloudRequestOpType::kDeleteOp);
     auto outcome = client_->DeleteObject(request);
+    t.SetSuccess(outcome.IsSuccess());
+    return outcome;
+  }
+
+  Aws::S3::Model::DeleteObjectsOutcome DeleteCloudObjects(
+      const Aws::S3::Model::DeleteObjectsRequest& request) {
+    CloudRequestCallbackGuard t(cloud_request_callback_.get(),
+                                CloudRequestOpType::kDeleteOp);
+    auto outcome = client_->DeleteObjects(request);
     t.SetSuccess(outcome.IsSuccess());
     return outcome;
   }
@@ -392,6 +405,10 @@ class S3StorageProvider : public CloudStorageProviderImpl {
                        const std::string& object_path) override;
   IOStatus DeleteCloudObject(const std::string& bucket_name,
                              const std::string& object_path) override;
+  IOStatus DeleteCloudObjects(const std::string& bucket_name,
+                              const std::vector<std::string>& object_paths,
+                              size_t* deleted_count,
+                              size_t* failed_count) override;
   IOStatus ListCloudObjects(const std::string& bucket_name,
                             const std::string& object_path,
                             std::vector<std::string>* result) override;
@@ -632,6 +649,73 @@ IOStatus S3StorageProvider::DeleteCloudObject(const std::string& bucket_name,
       object_path.c_str(), st.ToString().c_str());
 
   return st;
+}
+
+IOStatus S3StorageProvider::DeleteCloudObjects(
+    const std::string& bucket_name,
+    const std::vector<std::string>& object_paths, size_t* deleted_count,
+    size_t* failed_count) {
+  assert(deleted_count != nullptr && failed_count != nullptr);
+  IOStatus first_error;
+  // S3 DeleteObjects accepts at most 1000 keys per request. A key that does
+  // not exist is reported as deleted, matching the interface contract.
+  constexpr size_t kMaxKeysPerBatch = 1000;
+
+  for (size_t begin = 0; begin < object_paths.size();
+       begin += kMaxKeysPerBatch) {
+    size_t end = begin + kMaxKeysPerBatch;
+    if (end > object_paths.size()) {
+      end = object_paths.size();
+    }
+    size_t batch_size = end - begin;
+
+    Aws::S3::Model::Delete to_delete;
+    for (size_t i = begin; i < end; ++i) {
+      to_delete.AddObjects(
+          Aws::S3::Model::ObjectIdentifier().WithKey(
+              ToAwsString(object_paths[i])));
+    }
+    // Quiet mode: the response lists only the keys that failed.
+    to_delete.SetQuiet(true);
+
+    Aws::S3::Model::DeleteObjectsRequest request;
+    request.SetBucket(ToAwsString(bucket_name));
+    request.SetDelete(std::move(to_delete));
+
+    auto outcome = s3client_->DeleteCloudObjects(request);
+    if (!outcome.IsSuccess()) {
+      const Aws::Client::AWSError<Aws::S3::S3Errors>& error =
+          outcome.GetError();
+      std::string errmsg(error.GetMessage().c_str());
+      Log(InfoLogLevel::ERROR_LEVEL, cfs_->GetLogger(),
+          "[s3] DeleteObjects batch of %zu keys failed in bucket %s: %s",
+          batch_size, bucket_name.c_str(), errmsg.c_str());
+      *failed_count += batch_size;
+      if (first_error.ok()) {
+        first_error = IOStatus::IOError(bucket_name, errmsg.c_str());
+      }
+      continue;
+    }
+
+    const auto& errors = outcome.GetResult().GetErrors();
+    for (const auto& error : errors) {
+      Log(InfoLogLevel::ERROR_LEVEL, cfs_->GetLogger(),
+          "[s3] DeleteObjects failed to delete %s/%s: %s %s",
+          bucket_name.c_str(), error.GetKey().c_str(),
+          error.GetCode().c_str(), error.GetMessage().c_str());
+      if (first_error.ok()) {
+        first_error = IOStatus::IOError(std::string(error.GetKey().c_str()),
+                                        std::string(error.GetMessage().c_str()));
+      }
+    }
+    *failed_count += errors.size();
+    *deleted_count += batch_size - errors.size();
+
+    Log(InfoLogLevel::INFO_LEVEL, cfs_->GetLogger(),
+        "[s3] DeleteObjects deleted %zu of %zu keys from bucket %s",
+        batch_size - errors.size(), batch_size, bucket_name.c_str());
+  }
+  return first_error;
 }
 
 //

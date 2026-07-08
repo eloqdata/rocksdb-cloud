@@ -70,6 +70,20 @@ class CloudStorageProvider : public Configurable {
   virtual IOStatus DeleteCloudObject(const std::string& bucket_name,
                                      const std::string& object_path) = 0;
 
+  // Delete the specified objects from the specified cloud bucket. Attempts
+  // every object even when some deletions fail; an object that does not
+  // exist counts as deleted. Adds the number of objects deleted and failed
+  // to *deleted_count and *failed_count (both must be non-null). Returns OK
+  // when every object was deleted or already absent, otherwise the first
+  // failure.
+  //
+  // The base implementation deletes serially via DeleteCloudObject.
+  // Providers with a native bulk-delete API may override it.
+  virtual IOStatus DeleteCloudObjects(
+      const std::string& bucket_name,
+      const std::vector<std::string>& object_paths, size_t* deleted_count,
+      size_t* failed_count);
+
   // Does the specified object exist in the cloud storage
   // returns all the objects that have the specified path prefix and
   // are stored in a cloud bucket

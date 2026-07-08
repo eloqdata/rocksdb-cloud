@@ -976,8 +976,8 @@ set(SOURCES
         cloud/cloud_file_system_impl.cc
         cloud/cloud_log_controller.cc
         cloud/manifest_reader.cc
-        # cloud/purge.cc
-        cloud/improved_purger.cc
+        cloud/eloq_purger.cc
+        cloud/file_number_guard.cc
         cloud/cloud_manifest.cc
         cloud/cloud_scheduler.cc
         cloud/cloud_storage_provider.cc
@@ -1318,6 +1318,9 @@ if(WITH_TESTS)
         cloud/db_cloud_test.cc
         cloud/cloud_manifest_test.cc
         cloud/cloud_scheduler_test.cc
+        cloud/eloq_purger_test.cc
+        cloud/eloq_purger_integration_test.cc
+        cloud/file_number_guard_test.cc
         cloud/replication_test.cc
         cache/tiered_secondary_cache_test.cc
         db/blob/blob_counting_iterator_test.cc

@@ -14,6 +14,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 class CloudManifest;
+class FileNumberGuardPublisher;
 class CloudScheduler;
 class CloudStorageReadableFile;
 class ObjectLibrary;
@@ -395,12 +396,26 @@ class CloudFileSystemImpl : public CloudFileSystem {
   void Purger();
   void StopPurger();
 
+  // Publisher of the smallest_new_file_number guard object (see
+  // cloud/file_number_guard.h). Set by DBCloudImpl::Open when
+  // CloudFileSystemOptions::publish_file_number_guard is enabled; accessed
+  // via std::atomic_load/exchange.
+  std::shared_ptr<FileNumberGuardPublisher> file_number_guard_;
+
   // Delete all local files that are invisible
   IOStatus DeleteLocalInvisibleFiles(
       const std::string& dbname,
       const std::vector<std::string>& active_cookies) override;
 
  public:
+  // File number guard (defined in cloud/file_number_guard.cc).
+  void SetFileNumberGuardPublisher(
+      std::shared_ptr<FileNumberGuardPublisher> publisher);
+  std::shared_ptr<FileNumberGuardPublisher> GetFileNumberGuardPublisher()
+      const;
+  void StopFileNumberGuard();
+  Status BlockPurger() override;
+
   // returns the options used to create this object
   const CloudFileSystemOptions& GetCloudFileSystemOptions() const override {
     return cloud_fs_options;
