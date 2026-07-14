@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -35,8 +37,10 @@
 #include <vector>
 
 #include "cloud/cloud_manifest.h"
+#include "file/writable_file_writer.h"
 #include "rocksdb/cloud/cloud_file_system.h"
 #include "rocksdb/cloud/cloud_storage_provider.h"
+#include "rocksdb/cloud/cloud_storage_provider_impl.h"
 #include "test_util/testharness.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -55,6 +59,28 @@ CloudObjectInformation MakeInfo(uint64_t mtime) {
   return info;
 }
 
+class StringCloudReadableFile : public CloudStorageReadableFileImpl {
+public:
+  StringCloudReadableFile(const std::string &name, std::string contents)
+      : CloudStorageReadableFileImpl(nullptr, "test-bucket", name,
+                                     contents.size()),
+        contents_(std::move(contents)) {}
+
+protected:
+  IOStatus DoCloudRead(uint64_t offset, size_t n, const IOOptions &,
+                       char *scratch, uint64_t *bytes_read,
+                       IODebugContext *) const override {
+    const size_t available = contents_.size() - static_cast<size_t>(offset);
+    const size_t to_read = std::min(n, available);
+    std::memcpy(scratch, contents_.data() + offset, to_read);
+    *bytes_read = to_read;
+    return IOStatus::OK();
+  }
+
+private:
+  std::string contents_;
+};
+
 class RecordingPurgerStorageProvider : public CloudStorageProvider {
  public:
   using PurgerAllFiles = EloqPurger::PurgerAllFiles;
@@ -70,6 +96,10 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
 
   void SetGetStatus(const std::string &path, IOStatus status) {
     get_statuses_[path] = std::move(status);
+  }
+
+  void SetObjectContents(const std::string &path, std::string contents) {
+    object_contents_[path] = std::move(contents);
   }
 
   const std::vector<std::string> &delete_attempts() const {
@@ -181,11 +211,17 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
                                 IODebugContext *) override {
     return NotSupported();
   }
-  IOStatus NewCloudReadableFile(const std::string &, const std::string &,
-                                const FileOptions &,
-                                std::unique_ptr<CloudStorageReadableFile> *,
-                                IODebugContext *) override {
-    return NotSupported();
+  IOStatus
+  NewCloudReadableFile(const std::string &, const std::string &object_path,
+                       const FileOptions &,
+                       std::unique_ptr<CloudStorageReadableFile> *result,
+                       IODebugContext *) override {
+    auto contents = object_contents_.find(object_path);
+    if (contents == object_contents_.end()) {
+      return IOStatus::NotFound(object_path);
+    }
+    result->reset(new StringCloudReadableFile(object_path, contents->second));
+    return IOStatus::OK();
   }
 
  private:
@@ -197,6 +233,7 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
   std::string object_path_;
   std::unordered_map<std::string, IOStatus> delete_statuses_;
   std::unordered_map<std::string, IOStatus> get_statuses_;
+  std::unordered_map<std::string, std::string> object_contents_;
   std::unordered_set<std::string> clock_objects_;
   std::vector<std::string> delete_attempts_;
 };
@@ -464,8 +501,30 @@ TEST(EloqPurgerCycleTest, NotFoundDeletionCountsAsSuccess) {
 }
 
 TEST(EloqPurgerCycleTest, GuardReadIoErrorFailsClosed) {
+  const std::string cloud_manifest_name = "CLOUDMANIFEST-db-1";
+  const std::string sst_name = "000001.sst-epochA";
   auto provider = std::make_shared<RecordingPurgerStorageProvider>(
-      EloqPurger::PurgerAllFiles{});
+      EloqPurger::PurgerAllFiles{
+          {cloud_manifest_name, MakeInfo(kNow - 2 * kHourMs)},
+          {sst_name, MakeInfo(kNow - 2 * kHourMs)}});
+
+  std::unique_ptr<CloudManifest> manifest;
+  ASSERT_OK(CloudManifest::CreateForEmptyDatabase("epochA", &manifest));
+  const std::string manifest_path = test::TmpDir() +
+                                    "/purger_guard_read_error_cloud_manifest_" +
+                                    std::to_string(Env::Default()->NowMicros());
+  std::unique_ptr<WritableFileWriter> writer;
+  ASSERT_OK(WritableFileWriter::Create(FileSystem::Default(), manifest_path,
+                                       FileOptions(), &writer, nullptr));
+  ASSERT_OK(manifest->WriteToLog(std::move(writer)));
+  std::ifstream manifest_file(manifest_path, std::ios::binary);
+  const std::string manifest_contents(
+      (std::istreambuf_iterator<char>(manifest_file)),
+      std::istreambuf_iterator<char>());
+  ASSERT_FALSE(manifest_contents.empty());
+  ASSERT_EQ(std::remove(manifest_path.c_str()), 0);
+  provider->SetObjectContents("dbpath/" + cloud_manifest_name,
+                              manifest_contents);
   provider->SetGetStatus("dbpath/smallest_new_file_number-epochA",
                          IOStatus::IOError("injected guard read failure"));
   auto cfs = MakeCloudFileSystem(provider);
@@ -474,6 +533,10 @@ TEST(EloqPurgerCycleTest, GuardReadIoErrorFailsClosed) {
   uint64_t threshold = std::numeric_limits<uint64_t>::max();
   ASSERT_TRUE(reader.ReadSmallestFileNumber(&threshold).IsIOError());
   ASSERT_EQ(threshold, std::numeric_limits<uint64_t>::min());
+
+  EloqPurger purger(cfs.get(), "test-bucket", "dbpath", false /*dry_run*/,
+                    kHourMs, kHourMs, 10000);
+  ASSERT_FALSE(purger.RunSinglePurgeCycle());
   ASSERT_TRUE(provider->delete_attempts().empty());
 }
 

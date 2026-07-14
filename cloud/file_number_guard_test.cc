@@ -464,9 +464,11 @@ TEST_F(FileNumberGuardTest, ProtectWaitsForInFlightUpwardPublish) {
   SyncPoint::GetInstance()->EnableProcessing();
 
   std::thread periodic([&] { pub.PeriodicPublish(); });
+  bool reached = false;
   {
     std::unique_lock<std::mutex> lock(block_mutex);
-    block_cv.wait(lock, [&] { return upward_put_reached; });
+    reached = block_cv.wait_for(lock, kAsyncWaitTimeout,
+                                [&] { return upward_put_reached; });
   }
 
   pub.OnJobBegin(60, 3, 3);
@@ -482,6 +484,7 @@ TEST_F(FileNumberGuardTest, ProtectWaitsForInFlightUpwardPublish) {
   periodic.join();
   Status protection_status = protection.get();
 
+  EXPECT_TRUE(reached);
   ASSERT_EQ(state, std::future_status::timeout);
   ASSERT_OK(protection_status);
   ASSERT_EQ(provider_->Content(GuardKey()), "60");
@@ -759,6 +762,7 @@ TEST_F(FileNumberGuardTest, ConcurrentInstallsPublishSentinelsInOrder) {
   cv.notify_all();
   ASSERT_OK(first_install.get());
   ASSERT_OK(second_install.get());
+  ASSERT_EQ(provider_->PutCount(), 2);
 
   ASSERT_EQ(cfs_->GetFileNumberGuardPublisher(), second);
   ASSERT_EQ(provider_->Content(GuardKey()), "0");
@@ -866,8 +870,14 @@ TEST_F(FileNumberGuardTest, StartStopSchedulerSmoke) {
   pub->OnJobBegin(7, 1, 1);
   ASSERT_OK(pub->ProtectFileUpload(7));
   pub->OnJobEnd(1, 1);
-  // Let the recurring job run at least once (idle -> MAX eventually).
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  const int puts_before_periodic = provider_->PutCount();
+  const auto deadline = std::chrono::steady_clock::now() + kAsyncWaitTimeout;
+  while (provider_->PutCount() == puts_before_periodic &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_GT(provider_->PutCount(), puts_before_periodic);
+  EXPECT_EQ(provider_->Content(GuardKey()), std::to_string(kMax));
   pub->Stop();
   int puts_at_stop = provider_->PutCount();
   std::this_thread::sleep_for(std::chrono::milliseconds(60));
@@ -1056,7 +1066,7 @@ TEST_F(FileNumberGuardTest, GuardEnabledIdentityUploadPassesThrough) {
   ASSERT_EQ(provider_->PutCount(), 1);
 }
 
-TEST_F(FileNumberGuardTest, MalformedEpochSstUploadFailsClosed) {
+TEST_F(FileNumberGuardTest, MalformedFileNumberSstUploadFailsClosed) {
   LoadManifestWithEpoch("epoch1");
   auto pub = std::make_shared<FileNumberGuardPublisher>(
       cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
