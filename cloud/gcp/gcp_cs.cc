@@ -470,6 +470,9 @@ IOStatus GcsStorageProvider::ListCloudObjects(
   for (const auto& object : objects.value()) {
     if (!object.ok()) {
       std::string errmsg(object.status().message());
+      if (IsNotFound(object.status())) {
+        return IOStatus::NotFound(object_path, errmsg.c_str());
+      }
       return IOStatus::IOError(object_path, errmsg.c_str());
     }
     const auto& metadata = object.value();
