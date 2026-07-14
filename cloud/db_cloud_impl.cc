@@ -61,18 +61,18 @@ class ConstantSizeSstFileManager : public SstFileManagerImpl {
 };
 }  // namespace
 
-DBCloudImpl::DBCloudImpl(DB* db, std::unique_ptr<Env> local_env,
-                         CloudFileSystemImpl* cfs)
-    : DBCloud(db), cfs_(cfs), local_env_(std::move(local_env)) {}
+DBCloudImpl::DBCloudImpl(
+    DB *db, std::unique_ptr<Env> local_env, CloudFileSystemImpl *cfs,
+    std::shared_ptr<FileNumberGuardPublisher> guard_publisher)
+    : DBCloud(db), cfs_(cfs), local_env_(std::move(local_env)),
+      guard_publisher_(std::move(guard_publisher)) {}
 
 DBCloudImpl::~DBCloudImpl() {
-  if (cfs_ != nullptr) {
-    auto publisher = cfs_->GetFileNumberGuardPublisher();
-    if (publisher) {
-      // Keep the stopped gate installed so SST Close calls during wrapped-DB
-      // destruction fail instead of bypassing protection.
-      publisher->Stop();
-    }
+  if (cfs_ != nullptr && guard_publisher_) {
+    // Keep this DB's stopped gate installed so SST Close calls during wrapped
+    // DB destruction fail instead of bypassing protection. A later Open may
+    // already own the CFS, in which case its publisher must remain untouched.
+    cfs_->StopFileNumberGuardPublisher(guard_publisher_);
   }
   warm_up_is_running_.store(false, std::memory_order_release);
   for (auto& thd : warm_up_threads_) {
@@ -229,16 +229,10 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
       return Status::InvalidArgument(
           "publish_file_number_guard requires CloudFileSystemImpl");
     }
-    auto previous = guard_cfs->GetFileNumberGuardPublisher();
-    if (previous) {
-      // Keep the old gate installed until the replacement sentinel is known
-      // to be durable. A failed replacement therefore remains fail-closed.
-      previous->Stop();
-    }
     publisher = std::make_shared<FileNumberGuardPublisher>(
         guard_cfs, cfs->GetCloudFileSystemOptions().guard_publish_interval,
         cfs->GetCloudFileSystemOptions().guard_entry_duration);
-    st = publisher->BlockPurger();
+    st = guard_cfs->InstallFileNumberGuardPublisher(publisher);
     if (!st.ok()) {
       Log(InfoLogLevel::ERROR_LEVEL, options.info_log,
           "Failed to publish file number guard sentinel: %s",
@@ -247,7 +241,6 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
     }
     options.listeners.push_back(
         std::make_shared<FileNumberGuardListener>(publisher));
-    guard_cfs->SetFileNumberGuardPublisher(publisher);
   }
 
   DB* db = nullptr;
@@ -310,8 +303,9 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
         false;
   }
 
-  DBCloudImpl *cloud = new DBCloudImpl(
-      db, std::move(local_env), dynamic_cast<CloudFileSystemImpl *>(cfs));
+  DBCloudImpl *cloud =
+      new DBCloudImpl(db, std::move(local_env),
+                      dynamic_cast<CloudFileSystemImpl *>(cfs), publisher);
   *dbptr = cloud;
   db->GetDbIdentity(dbid);
   Log(InfoLogLevel::INFO_LEVEL, options.info_log,

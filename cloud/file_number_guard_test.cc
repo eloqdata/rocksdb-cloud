@@ -632,11 +632,137 @@ TEST_F(FileNumberGuardTest, ConditionalPublisherRemovalPreservesReplacement) {
   cfs_->SetFileNumberGuardPublisher(replacement);
 
   ASSERT_TRUE(old->ProtectFileUpload(1).IsShutdownInProgress());
+  ASSERT_FALSE(cfs_->StopFileNumberGuardPublisher(old));
   ASSERT_FALSE(cfs_->RemoveFileNumberGuardPublisher(old));
   ASSERT_EQ(cfs_->GetFileNumberGuardPublisher(), replacement);
+  ASSERT_TRUE(cfs_->StopFileNumberGuardPublisher(replacement));
+  ASSERT_EQ(cfs_->GetFileNumberGuardPublisher(), replacement);
+  ASSERT_TRUE(replacement->ProtectFileUpload(1).IsShutdownInProgress());
   ASSERT_TRUE(cfs_->RemoveFileNumberGuardPublisher(replacement));
   ASSERT_EQ(cfs_->GetFileNumberGuardPublisher(), nullptr);
-  ASSERT_TRUE(replacement->ProtectFileUpload(1).IsShutdownInProgress());
+}
+
+TEST_F(FileNumberGuardTest, InstallWaitsForOldPublisherBeforeSentinel) {
+  LoadManifestWithEpoch("epoch1");
+  auto old = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::milliseconds(0));
+  old->OnJobBegin(10, 1, 1);
+  cfs_->SetFileNumberGuardPublisher(old);
+  ASSERT_OK(old->ProtectFileUpload(10));
+  old->OnJobEnd(1, 1);
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool old_put_reached = false;
+  bool release_old_put = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FileNumberGuard::PutSmallestFileNumberObject:Status", [&](void *) {
+        if (provider_->Content(GuardKey()) != std::to_string(kMax)) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mutex);
+        old_put_reached = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_old_put; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  auto old_publish =
+      std::async(std::launch::async, [&] { old->PeriodicPublish(); });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    const bool reached =
+        cv.wait_for(lock, kAsyncWaitTimeout, [&] { return old_put_reached; });
+    EXPECT_TRUE(reached);
+  }
+
+  auto replacement = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+  auto install = std::async(std::launch::async, [&] {
+    return cfs_->InstallFileNumberGuardPublisher(replacement);
+  });
+  const auto install_state = install.wait_for(std::chrono::milliseconds(100));
+  EXPECT_EQ(install_state, std::future_status::timeout);
+
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release_old_put = true;
+  }
+  cv.notify_all();
+  old_publish.get();
+  ASSERT_OK(install.get());
+
+  ASSERT_EQ(cfs_->GetFileNumberGuardPublisher(), replacement);
+  ASSERT_EQ(provider_->Content(GuardKey()), "0");
+  ASSERT_TRUE(old->ProtectFileUpload(10).IsShutdownInProgress());
+}
+
+TEST_F(FileNumberGuardTest, FailedInstallKeepsOldPublisherFailClosed) {
+  LoadManifestWithEpoch("epoch1");
+  auto old = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+  auto replacement = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+  cfs_->SetFileNumberGuardPublisher(old);
+  provider_->SetPutStatus(GuardKey(), IOStatus::IOError("sentinel failure"));
+
+  ASSERT_NOK(cfs_->InstallFileNumberGuardPublisher(replacement));
+  ASSERT_EQ(cfs_->GetFileNumberGuardPublisher(), old);
+  ASSERT_TRUE(old->ProtectFileUpload(1).IsShutdownInProgress());
+}
+
+TEST_F(FileNumberGuardTest, ConcurrentInstallsPublishSentinelsInOrder) {
+  LoadManifestWithEpoch("epoch1");
+  auto first = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+  auto second = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool block_first_sentinel = true;
+  bool first_sentinel_reached = false;
+  bool release_first_sentinel = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FileNumberGuard::PutSmallestFileNumberObject:Status", [&](void *) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!block_first_sentinel || provider_->Content(GuardKey()) != "0") {
+          return;
+        }
+        block_first_sentinel = false;
+        first_sentinel_reached = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_first_sentinel; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  auto first_install = std::async(std::launch::async, [&] {
+    return cfs_->InstallFileNumberGuardPublisher(first);
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    const bool reached = cv.wait_for(lock, kAsyncWaitTimeout,
+                                     [&] { return first_sentinel_reached; });
+    EXPECT_TRUE(reached);
+  }
+  auto second_install = std::async(std::launch::async, [&] {
+    return cfs_->InstallFileNumberGuardPublisher(second);
+  });
+  const auto second_install_state =
+      second_install.wait_for(std::chrono::milliseconds(100));
+  EXPECT_EQ(second_install_state, std::future_status::timeout);
+
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release_first_sentinel = true;
+  }
+  cv.notify_all();
+  ASSERT_OK(first_install.get());
+  ASSERT_OK(second_install.get());
+
+  ASSERT_EQ(cfs_->GetFileNumberGuardPublisher(), second);
+  ASSERT_EQ(provider_->Content(GuardKey()), "0");
+  ASSERT_TRUE(first->ProtectFileUpload(1).IsShutdownInProgress());
 }
 
 // Failure injection: the downward PUT fails; the publisher must retry and

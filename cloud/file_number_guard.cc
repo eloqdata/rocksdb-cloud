@@ -532,10 +532,33 @@ void FileNumberGuardListener::OnTableFileCreated(
 
 void CloudFileSystemImpl::SetFileNumberGuardPublisher(
     std::shared_ptr<FileNumberGuardPublisher> publisher) {
-  auto previous = std::atomic_exchange(&file_number_guard_, publisher);
+  std::lock_guard<std::mutex> install_lk(file_number_guard_install_mutex_);
+  auto previous = std::atomic_load(&file_number_guard_);
   if (previous) {
     previous->Stop();
   }
+  std::atomic_store(&file_number_guard_, std::move(publisher));
+}
+
+Status CloudFileSystemImpl::InstallFileNumberGuardPublisher(
+    const std::shared_ptr<FileNumberGuardPublisher> &publisher) {
+  if (!publisher) {
+    return Status::InvalidArgument("null file number guard publisher");
+  }
+  std::lock_guard<std::mutex> install_lk(file_number_guard_install_mutex_);
+  auto previous = std::atomic_load(&file_number_guard_);
+  if (previous) {
+    previous->Stop();
+  }
+
+  Status status = publisher->BlockPurger();
+  if (!status.ok()) {
+    // Leave the old stopped publisher installed. Until a later successful
+    // replacement, uploads then fail closed instead of bypassing the guard.
+    return status;
+  }
+  std::atomic_store(&file_number_guard_, publisher);
+  return Status::OK();
 }
 
 bool CloudFileSystemImpl::RemoveFileNumberGuardPublisher(
@@ -543,10 +566,24 @@ bool CloudFileSystemImpl::RemoveFileNumberGuardPublisher(
   if (!expected) {
     return false;
   }
-  auto current = expected;
-  if (!std::atomic_compare_exchange_strong(
-          &file_number_guard_, &current,
-          std::shared_ptr<FileNumberGuardPublisher>())) {
+  std::lock_guard<std::mutex> install_lk(file_number_guard_install_mutex_);
+  auto current = std::atomic_load(&file_number_guard_);
+  if (current != expected) {
+    return false;
+  }
+  expected->Stop();
+  std::atomic_store(&file_number_guard_,
+                    std::shared_ptr<FileNumberGuardPublisher>());
+  return true;
+}
+
+bool CloudFileSystemImpl::StopFileNumberGuardPublisher(
+    const std::shared_ptr<FileNumberGuardPublisher> &expected) {
+  if (!expected) {
+    return false;
+  }
+  std::lock_guard<std::mutex> install_lk(file_number_guard_install_mutex_);
+  if (std::atomic_load(&file_number_guard_) != expected) {
     return false;
   }
   expected->Stop();
@@ -559,15 +596,18 @@ CloudFileSystemImpl::GetFileNumberGuardPublisher() const {
 }
 
 void CloudFileSystemImpl::StopFileNumberGuard() {
-  auto publisher = std::atomic_exchange(
-      &file_number_guard_, std::shared_ptr<FileNumberGuardPublisher>());
+  std::lock_guard<std::mutex> install_lk(file_number_guard_install_mutex_);
+  auto publisher = std::atomic_load(&file_number_guard_);
   if (publisher) {
     publisher->Stop();
+    std::atomic_store(&file_number_guard_,
+                      std::shared_ptr<FileNumberGuardPublisher>());
   }
 }
 
 Status CloudFileSystemImpl::BlockPurger() {
-  auto publisher = GetFileNumberGuardPublisher();
+  std::lock_guard<std::mutex> install_lk(file_number_guard_install_mutex_);
+  auto publisher = std::atomic_load(&file_number_guard_);
   if (publisher) {
     return publisher->BlockPurger();
   }
