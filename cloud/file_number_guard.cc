@@ -177,21 +177,30 @@ void FileNumberGuardPublisher::Start() {
 
 void FileNumberGuardPublisher::Stop() {
   long handle = -1;
+  bool notify = false;
   {
     std::lock_guard<std::mutex> lk(stop_mutex_);
-    if (stopped_) {
-      return;
+    if (!stopped_) {
+      stopped_ = true;
+      notify = true;
+      handle = job_handle_;
+      job_handle_ = -1;
     }
-    stopped_ = true;
-    handle = job_handle_;
-    job_handle_ = -1;
   }
-  stop_cv_.notify_all();
+  if (notify) {
+    stop_cv_.notify_all();
+  }
   if (handle >= 0) {
     // Waits for a currently running periodic callback to finish, so after
     // this returns no callback can touch this object.
     scheduler_->CancelJob(handle);
   }
+
+  // ProtectFileUpload holds this gate across both guard publication and the
+  // SST upload. Since stopped_ was set first, a protection that has not yet
+  // crossed its final stopped_ check cannot start an upload; one that has
+  // crossed it completes before this lock is acquired.
+  std::lock_guard<std::mutex> publish_lk(publish_mutex_);
 }
 
 std::string FileNumberGuardPublisher::CurrentEpoch() const {
@@ -214,7 +223,8 @@ Status FileNumberGuardPublisher::OnJobBegin(uint64_t file_number,
   return Status::OK();
 }
 
-Status FileNumberGuardPublisher::ProtectFileUpload(uint64_t file_number) {
+Status FileNumberGuardPublisher::ProtectFileUpload(
+    uint64_t file_number, const std::function<void()> &upload) {
   {
     std::lock_guard<std::mutex> lk(stop_mutex_);
     if (stopped_) {
@@ -231,6 +241,7 @@ Status FileNumberGuardPublisher::ProtectFileUpload(uint64_t file_number) {
   }
 
   uint64_t desired;
+  bool needs_publish;
   {
     std::lock_guard<std::mutex> lk(state_mutex_);
     desired = window_.SmallestFileNumber();
@@ -241,50 +252,64 @@ Status FileNumberGuardPublisher::ProtectFileUpload(uint64_t file_number) {
       return Status::InvalidArgument(
           "live file number minimum exceeds SST file number");
     }
-    if (desired >= last_published_) {
-      return Status::OK();
+    needs_publish = desired < last_published_;
+  }
+
+  if (needs_publish) {
+    std::string epoch = CurrentEpoch();
+    if (epoch.empty()) {
+      Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+          "[fng] Cannot protect SST %llu: epoch unavailable",
+          static_cast<unsigned long long>(file_number));
+      return Status::InvalidArgument("empty epoch for file number guard");
     }
-  }
 
-  std::string epoch = CurrentEpoch();
-  if (epoch.empty()) {
-    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
-        "[fng] Cannot protect SST %llu: epoch unavailable",
-        static_cast<unsigned long long>(file_number));
-    return Status::InvalidArgument("empty epoch for file number guard");
-  }
-
-  Status st;
-  auto backoff = std::chrono::milliseconds(100);
-  const auto max_backoff = std::chrono::milliseconds(2000);
-  while (true) {
-    {
-      std::lock_guard<std::mutex> lk(stop_mutex_);
-      if (stopped_) {
+    Status st;
+    auto backoff = std::chrono::milliseconds(100);
+    const auto max_backoff = std::chrono::milliseconds(2000);
+    while (true) {
+      {
+        std::lock_guard<std::mutex> lk(stop_mutex_);
+        if (stopped_) {
+          return Status::ShutdownInProgress("file number guard stopped");
+        }
+      }
+      st = PutValue(desired, epoch);
+      if (st.ok()) {
+        std::lock_guard<std::mutex> lk(state_mutex_);
+        if (desired < last_published_) {
+          last_published_ = desired;
+        }
+        sentinel_dirty_ = false;
+        break;
+      }
+      Log(InfoLogLevel::WARN_LEVEL, cfs_->info_log_,
+          "[fng] Downward publish of %llu for SST %llu failed (%s); retrying "
+          "in %lld ms",
+          static_cast<unsigned long long>(desired),
+          static_cast<unsigned long long>(file_number), st.ToString().c_str(),
+          static_cast<long long>(backoff.count()));
+      std::unique_lock<std::mutex> lk(stop_mutex_);
+      if (stop_cv_.wait_for(lk, backoff, [this] { return stopped_; })) {
         return Status::ShutdownInProgress("file number guard stopped");
       }
+      backoff = std::min(backoff * 2, max_backoff);
     }
-    st = PutValue(desired, epoch);
-    if (st.ok()) {
-      std::lock_guard<std::mutex> lk(state_mutex_);
-      if (desired < last_published_) {
-        last_published_ = desired;
-      }
-      sentinel_dirty_ = false;
-      return Status::OK();
-    }
-    Log(InfoLogLevel::WARN_LEVEL, cfs_->info_log_,
-        "[fng] Downward publish of %llu for SST %llu failed (%s); retrying "
-        "in %lld ms",
-        static_cast<unsigned long long>(desired),
-        static_cast<unsigned long long>(file_number), st.ToString().c_str(),
-        static_cast<long long>(backoff.count()));
-    std::unique_lock<std::mutex> lk(stop_mutex_);
-    if (stop_cv_.wait_for(lk, backoff, [this] { return stopped_; })) {
+  }
+
+  {
+    // This check is the upload/Stop linearization point. publish_mutex_ stays
+    // held through upload, so Stop either sets stopped_ before this check or
+    // waits for the callback to finish.
+    std::lock_guard<std::mutex> lk(stop_mutex_);
+    if (stopped_) {
       return Status::ShutdownInProgress("file number guard stopped");
     }
-    backoff = std::min(backoff * 2, max_backoff);
   }
+  if (upload) {
+    upload();
+  }
+  return Status::OK();
 }
 
 void FileNumberGuardPublisher::OnJobEnd(uint64_t thread_id, int job_id) {
@@ -344,6 +369,13 @@ void FileNumberGuardPublisher::PeriodicPublish() {
   std::unique_lock<std::mutex> publish_lk(publish_mutex_, std::try_to_lock);
   if (!publish_lk.owns_lock()) {
     return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(stop_mutex_);
+    if (stopped_) {
+      return;
+    }
   }
 
   {

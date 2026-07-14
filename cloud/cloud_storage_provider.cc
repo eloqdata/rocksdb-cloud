@@ -114,7 +114,6 @@ CloudStorageWritableFileImpl::CloudStorageWritableFileImpl(
   auto fname_no_epoch = RemoveEpoch(fname_);
   // Is this a manifest file?
   is_manifest_ = IsManifestFile(fname_no_epoch);
-  assert(IsSstFile(fname_no_epoch) || is_manifest_);
 
   Log(InfoLogLevel::DEBUG_LEVEL, cfs_->GetLogger(),
       "[%s] CloudWritableFile bucket %s opened local file %s "
@@ -177,6 +176,7 @@ IOStatus CloudStorageWritableFileImpl::Close(const IOOptions& opts,
   local_file_.reset();
 
   if (!is_manifest_) {
+    bool uploaded = false;
     auto* cfs_impl = dynamic_cast<CloudFileSystemImpl*>(cfs_);
     if (cfs_impl != nullptr) {
       auto publisher = cfs_impl->GetFileNumberGuardPublisher();
@@ -184,20 +184,28 @@ IOStatus CloudStorageWritableFileImpl::Close(const IOOptions& opts,
         uint64_t file_number = 0;
         FileType file_type;
         const std::string logical_name = basename(RemoveEpoch(fname_));
-        if (!ParseFileName(logical_name, &file_number, &file_type) ||
-            file_type != kTableFile) {
+        const bool parsed =
+            ParseFileName(logical_name, &file_number, &file_type);
+        if (!parsed && IsSstFile(logical_name)) {
           status_ = IOStatus::InvalidArgument("cannot parse SST file number",
                                               logical_name);
           return status_;
         }
-        status_ =
-            status_to_io_status(publisher->ProtectFileUpload(file_number));
-        if (!status_.ok()) {
-          return status_;
+        if (parsed && file_type == kTableFile) {
+          Status protection = publisher->ProtectFileUpload(file_number, [&] {
+            status_ = cfs_->CopyLocalFileToDest(fname_, cloud_fname_);
+          });
+          if (!protection.ok()) {
+            status_ = status_to_io_status(std::move(protection));
+            return status_;
+          }
+          uploaded = true;
         }
       }
     }
-    status_ = cfs_->CopyLocalFileToDest(fname_, cloud_fname_);
+    if (!uploaded) {
+      status_ = cfs_->CopyLocalFileToDest(fname_, cloud_fname_);
+    }
     if (!status_.ok()) {
       Log(InfoLogLevel::ERROR_LEVEL, cfs_->GetLogger(),
           "[%s] CloudWritableFile closing PutObject failed on local file %s",

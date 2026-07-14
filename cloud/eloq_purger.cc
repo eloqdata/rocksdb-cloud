@@ -280,6 +280,8 @@ bool EloqPurger::RunSinglePurgeCycle() {
                                   &state.obsolete_files);
 
   Status deletion_status;
+  size_t deleted = 0;
+  size_t failures = 0;
   if (dry_run_) {
     Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
         "[pg] DRY RUN: Would delete %zu files", state.obsolete_files.size());
@@ -288,14 +290,17 @@ bool EloqPurger::RunSinglePurgeCycle() {
           "[pg] DRY RUN: Would delete %s", file.c_str());
     }
   } else {
-    deletion_status = DeleteObsoleteFiles(state.obsolete_files);
+    deletion_status =
+        DeleteObsoleteFiles(state.obsolete_files, &deleted, &failures);
   }
 
   Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
       "[pg] Purge cycle summary: total_files=%zu manifests=%zu "
-      "live_files=%zu obsolete_selected=%zu thresholds_loaded=%zu",
+      "live_files=%zu obsolete_selected=%zu deleted=%zu failed=%zu "
+      "thresholds_loaded=%zu",
       state.all_files.size(), state.cloudmanifests.size(),
-      state.live_file_names.size(), state.obsolete_files.size(),
+      state.live_file_names.size(), state.obsolete_files.size(), deleted,
+      failures,
       state.file_number_thresholds.size());
 
   return deletion_status.ok();
@@ -904,9 +909,8 @@ void EloqPurger::SelectObsoleteFileNumberMarkers(
 }
 
 Status EloqPurger::DeleteObsoleteFiles(
-    const std::vector<std::string> &obsolete_files) {
-  size_t deleted = 0;
-  size_t failures = 0;
+    const std::vector<std::string> &obsolete_files, size_t *deleted,
+    size_t *failures) {
 
   size_t to_delete = obsolete_files.size();
   if (max_deletions_per_cycle_ > 0 && to_delete > max_deletions_per_cycle_) {
@@ -927,12 +931,12 @@ Status EloqPurger::DeleteObsoleteFiles(
   }
 
   IOStatus s = cfs_->GetStorageProvider()->DeleteCloudObjects(
-      bucket_name_, paths_to_delete, &deleted, &failures);
+      bucket_name_, paths_to_delete, deleted, failures);
   if (!s.ok()) {
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
         "[pg] Obsolete deletion failed: selected=%zu requested=%zu "
         "deleted=%zu failures=%zu: %s",
-        obsolete_files.size(), to_delete, deleted, failures,
+        obsolete_files.size(), to_delete, *deleted, *failures,
         s.ToString().c_str());
     return s;
   }
@@ -940,7 +944,7 @@ Status EloqPurger::DeleteObsoleteFiles(
   Log(InfoLogLevel::DEBUG_LEVEL, cfs_->info_log_,
       "[pg] Obsolete deletion summary: selected=%zu requested=%zu "
       "deleted=%zu failures=%zu",
-      obsolete_files.size(), to_delete, deleted, failures);
+      obsolete_files.size(), to_delete, *deleted, *failures);
   return Status::OK();
 }
 

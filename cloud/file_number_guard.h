@@ -25,6 +25,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -106,10 +107,11 @@ class FileNumberSlidingWindow {
 //  - publish_mutex_ serializes every S3 PUT. Two concurrent PUTs could land
 //    out of order and reinstate a dangerously high threshold; the publish
 //    mutex plus the post-acquire staleness re-check make that impossible.
-//  - ProtectFileUpload serializes a required downward PUT and retries with
-//    backoff until it succeeds or Stop() is called. The SST upload is blocked
-//    rather than allowed to proceed unprotected. last_published_ only advances
-//    after a successful PUT.
+//  - ProtectFileUpload serializes a required downward PUT and the protected
+//    SST upload callback. Stop() first marks the publisher stopped, then waits
+//    on the same publish gate. Thus Stop wins before the callback or waits for
+//    an upload that already crossed the stopped_ check. last_published_ only
+//    advances after a successful PUT.
 //
 // cfs_ is non-owning. CloudFileSystemImpl owns an installed publisher and
 // synchronously stops it before destroying the manifest and storage-provider
@@ -128,8 +130,9 @@ class FileNumberGuardPublisher {
   // Schedules the periodic publish job. Idempotent.
   void Start();
 
-  // Cancels the periodic job and unblocks any in-progress downward retry
-  // loop. Idempotent; called from the destructor.
+  // Cancels the periodic job, unblocks any in-progress downward retry loop,
+  // and waits for any protected SST upload already in progress. Idempotent;
+  // called from the destructor.
   void Stop();
 
   // Registers a flush/compaction job in the live window. This bookkeeping-only
@@ -140,9 +143,12 @@ class FileNumberGuardPublisher {
   void OnJobEnd(uint64_t thread_id, int job_id);
 
   // Ensures the current live-window minimum is published at or below the SST
-  // file number before upload. A required downward PUT retries until it
-  // succeeds or Stop() interrupts it.
-  Status ProtectFileUpload(uint64_t file_number);
+  // file number, then invokes upload while holding the serialized publish
+  // gate. A required downward PUT retries until it succeeds or Stop()
+  // interrupts it. Tests may omit upload to exercise protection alone.
+  Status ProtectFileUpload(
+      uint64_t file_number,
+      const std::function<void()> &upload = std::function<void()>());
 
   // Publishes the 0 sentinel ("purging blocked") for the current epoch.
   // Does not advance last_published_, so the next real value (including a

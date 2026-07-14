@@ -59,6 +59,8 @@ class RecordingStorageProvider : public CloudStorageProvider {
   IOStatus PutCloudObject(const std::string &local_path,
                           const std::string & /*bucket_name*/,
                           const std::string &object_path) override {
+    TEST_SYNC_POINT_CALLBACK("FileNumberGuardTest::PutCloudObject",
+                             const_cast<std::string *>(&object_path));
     std::ifstream f(local_path);
     std::string content((std::istreambuf_iterator<char>(f)),
                         std::istreambuf_iterator<char>());
@@ -646,6 +648,124 @@ TEST_F(FileNumberGuardTest, StoppedPublisherRejectsSstUpload) {
 
   ASSERT_NOK(file.Close(IOOptions(), nullptr));
   ASSERT_FALSE(provider_->HasObject(object_path));
+}
+
+TEST_F(FileNumberGuardTest, StopDuringGuardPublishPreventsSstUpload) {
+  LoadManifestWithEpoch("epoch1");
+  auto pub = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+  ASSERT_OK(pub->OnJobBegin(123, 1, 1));
+  cfs_->SetFileNumberGuardPublisher(pub);
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool guard_put_reached = false;
+  bool release_guard_put = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FileNumberGuard::PutSmallestFileNumberObject:Status", [&](void *) {
+        std::unique_lock<std::mutex> lock(mutex);
+        guard_put_reached = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_guard_put; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  const std::string local_path = tmp_dir_ + "/000123.sst-epoch1";
+  const std::string object_path = "dbpath/000123.sst-epoch1";
+  CloudStorageWritableFileImpl file(cfs_.get(), local_path, "guard-bucket",
+                                    object_path, FileOptions());
+  ASSERT_OK(file.status());
+  ASSERT_OK(file.Append(Slice("sst contents"), IOOptions(), nullptr));
+
+  auto close = std::async(std::launch::async,
+                          [&] { return file.Close(IOOptions(), nullptr); });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [&] { return guard_put_reached; });
+  }
+  auto stop = std::async(std::launch::async, [&] { pub->Stop(); });
+  const auto stop_state = stop.wait_for(std::chrono::milliseconds(100));
+
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release_guard_put = true;
+  }
+  cv.notify_all();
+  const IOStatus close_status = close.get();
+  stop.get();
+
+  ASSERT_EQ(stop_state, std::future_status::timeout);
+  ASSERT_NOK(close_status);
+  ASSERT_FALSE(provider_->HasObject(object_path));
+}
+
+TEST_F(FileNumberGuardTest, StopWaitsForProtectedSstUpload) {
+  LoadManifestWithEpoch("epoch1");
+  auto pub = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+  ASSERT_OK(pub->OnJobBegin(123, 1, 1));
+  cfs_->SetFileNumberGuardPublisher(pub);
+
+  const std::string local_path = tmp_dir_ + "/000123.sst-epoch1";
+  const std::string object_path = "dbpath/000123.sst-epoch1";
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool upload_reached = false;
+  bool release_upload = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FileNumberGuardTest::PutCloudObject", [&](void *arg) {
+        if (*static_cast<std::string *>(arg) != object_path) {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(mutex);
+        upload_reached = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release_upload; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  CloudStorageWritableFileImpl file(cfs_.get(), local_path, "guard-bucket",
+                                    object_path, FileOptions());
+  ASSERT_OK(file.status());
+  ASSERT_OK(file.Append(Slice("sst contents"), IOOptions(), nullptr));
+
+  auto close = std::async(std::launch::async,
+                          [&] { return file.Close(IOOptions(), nullptr); });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait(lock, [&] { return upload_reached; });
+  }
+  auto stop = std::async(std::launch::async, [&] { pub->Stop(); });
+  const auto stop_state = stop.wait_for(std::chrono::milliseconds(100));
+
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    release_upload = true;
+  }
+  cv.notify_all();
+  ASSERT_OK(close.get());
+  stop.get();
+
+  ASSERT_EQ(stop_state, std::future_status::timeout);
+  ASSERT_TRUE(provider_->HasObject(object_path));
+}
+
+TEST_F(FileNumberGuardTest, GuardEnabledIdentityUploadPassesThrough) {
+  LoadManifestWithEpoch("epoch1");
+  auto pub = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+  cfs_->SetFileNumberGuardPublisher(pub);
+
+  const std::string local_path = tmp_dir_ + "/IDENTITY";
+  const std::string object_path = "dbpath/IDENTITY";
+  CloudStorageWritableFileImpl file(cfs_.get(), local_path, "guard-bucket",
+                                    object_path, FileOptions());
+  ASSERT_OK(file.status());
+  ASSERT_OK(file.Append(Slice("db-id"), IOOptions(), nullptr));
+
+  ASSERT_OK(file.Close(IOOptions(), nullptr));
+  ASSERT_TRUE(provider_->HasObject(object_path));
+  ASSERT_EQ(provider_->PutCount(), 1);
 }
 
 }  //  namespace ROCKSDB_NAMESPACE

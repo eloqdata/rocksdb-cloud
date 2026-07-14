@@ -23,6 +23,8 @@
 #include "cloud/eloq_purger.h"
 
 #include <algorithm>
+#include <cstdarg>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -193,15 +195,31 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
   std::vector<std::string> delete_attempts_;
 };
 
+class RecordingLogger : public Logger {
+ public:
+  using Logger::Logv;
+  void Logv(const char *format, va_list ap) override {
+    char buffer[2048];
+    vsnprintf(buffer, sizeof(buffer), format, ap);
+    log_.append(buffer).push_back('\n');
+  }
+
+  const std::string &log() const { return log_; }
+
+ private:
+  std::string log_;
+};
+
 std::unique_ptr<CloudFileSystemImpl> MakeCloudFileSystem(
-    const std::shared_ptr<CloudStorageProvider> &provider) {
+    const std::shared_ptr<CloudStorageProvider> &provider,
+    const std::shared_ptr<Logger> &logger = nullptr) {
   CloudFileSystemOptions opts;
   opts.storage_provider = provider;
   opts.dest_bucket.SetBucketName("test-bucket");
   opts.dest_bucket.SetObjectPath("dbpath");
   opts.cloud_file_deletion_delay = std::nullopt;
   return std::make_unique<CloudFileSystemImpl>(opts, FileSystem::Default(),
-                                               nullptr /*logger*/);
+                                               logger);
 }
 
 }  // namespace
@@ -470,13 +488,17 @@ TEST(EloqPurgerCycleTest, BulkDeleteFailureFailsCycle) {
       EloqPurger::PurgerAllFiles{{file, MakeInfo(kNow - 2 * kHourMs)}});
   provider->SetDeleteStatus("dbpath/" + file,
                             IOStatus::IOError("injected delete failure"));
-  auto cfs = MakeCloudFileSystem(provider);
+  auto logger = std::make_shared<RecordingLogger>();
+  auto cfs = MakeCloudFileSystem(provider, logger);
   EloqPurger purger(cfs.get(), "test-bucket", "dbpath", false /*dry_run*/,
                     kHourMs, kHourMs, 10000);
 
   ASSERT_FALSE(purger.RunSinglePurgeCycle());
   ASSERT_EQ(provider->delete_attempts(),
             std::vector<std::string>{"dbpath/" + file});
+  ASSERT_NE(logger->log().find(
+                "obsolete_selected=1 deleted=0 failed=1"),
+            std::string::npos);
 }
 
 }  //  namespace ROCKSDB_NAMESPACE
