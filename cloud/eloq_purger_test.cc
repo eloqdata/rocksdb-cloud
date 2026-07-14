@@ -68,6 +68,10 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
     delete_statuses_[path] = std::move(status);
   }
 
+  void SetGetStatus(const std::string &path, IOStatus status) {
+    get_statuses_[path] = std::move(status);
+  }
+
   const std::vector<std::string> &delete_attempts() const {
     return delete_attempts_;
   }
@@ -161,9 +165,10 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
                            const std::string &, const std::string &) override {
     return NotSupported();
   }
-  IOStatus GetCloudObject(const std::string &, const std::string &,
+  IOStatus GetCloudObject(const std::string &, const std::string &object_path,
                           const std::string &) override {
-    return NotSupported();
+    auto status = get_statuses_.find(object_path);
+    return status == get_statuses_.end() ? NotSupported() : status->second;
   }
   IOStatus PutCloudObjectMetadata(
       const std::string &, const std::string &,
@@ -191,6 +196,7 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
   PurgerAllFiles files_;
   std::string object_path_;
   std::unordered_map<std::string, IOStatus> delete_statuses_;
+  std::unordered_map<std::string, IOStatus> get_statuses_;
   std::unordered_set<std::string> clock_objects_;
   std::vector<std::string> delete_attempts_;
 };
@@ -455,6 +461,20 @@ TEST(EloqPurgerCycleTest, NotFoundDeletionCountsAsSuccess) {
   ASSERT_TRUE(purger.RunSinglePurgeCycle());
   ASSERT_EQ(provider->delete_attempts(),
             std::vector<std::string>{"dbpath/" + file});
+}
+
+TEST(EloqPurgerCycleTest, GuardReadIoErrorFailsClosed) {
+  auto provider = std::make_shared<RecordingPurgerStorageProvider>(
+      EloqPurger::PurgerAllFiles{});
+  provider->SetGetStatus("dbpath/smallest_new_file_number-epochA",
+                         IOStatus::IOError("injected guard read failure"));
+  auto cfs = MakeCloudFileSystem(provider);
+  S3FileNumberReader reader("test-bucket", "dbpath", "epochA", cfs.get());
+
+  uint64_t threshold = std::numeric_limits<uint64_t>::max();
+  ASSERT_TRUE(reader.ReadSmallestFileNumber(&threshold).IsIOError());
+  ASSERT_EQ(threshold, std::numeric_limits<uint64_t>::min());
+  ASSERT_TRUE(provider->delete_attempts().empty());
 }
 
 TEST(EloqPurgerCycleTest, DeletionCapConsumesDeterministicPrefixThenConverges) {

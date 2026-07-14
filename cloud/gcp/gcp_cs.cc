@@ -452,11 +452,45 @@ IOStatus GcsStorageProvider::EmptyBucket(std::string const& bucket_name,
   return IOStatus::OK();
 }
 
-IOStatus GcsStorageProvider::ListCloudObjects(const std::string& /*bucket_name*/,
-                          const std::string& /*object_path*/,
-                          std::vector<std::pair<std::string,
-                          CloudObjectInformation>>* /*result*/) {
-  return IOStatus::NotSupported("GcsStorageProvider::ListCloudObjects");
+IOStatus GcsStorageProvider::ListCloudObjects(
+    const std::string& bucket_name, const std::string& object_path,
+    std::vector<std::pair<std::string, CloudObjectInformation>>* result) {
+  auto prefix = ensure_ends_with_pathsep(normalzie_object_path(object_path));
+  auto objects = gcs_client_->ListCloudObjects(
+      bucket_name, prefix,
+      cfs_->GetCloudFileSystemOptions().number_objects_listed_in_one_iteration);
+  if (!objects.ok()) {
+    std::string errmsg(objects.status().message());
+    if (IsNotFound(objects.status())) {
+      return IOStatus::NotFound(object_path, errmsg.c_str());
+    }
+    return IOStatus::IOError(object_path, errmsg.c_str());
+  }
+
+  for (const auto& object : objects.value()) {
+    if (!object.ok()) {
+      std::string errmsg(object.status().message());
+      return IOStatus::IOError(object_path, errmsg.c_str());
+    }
+    const auto& metadata = object.value();
+    const std::string& name = metadata.name();
+    if (name.find(prefix) != 0) {
+      return IOStatus::IOError("Unexpected result from Gcs: " + name);
+    }
+
+    CloudObjectInformation info;
+    info.size = metadata.size();
+    info.modification_time =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            metadata.updated().time_since_epoch())
+            .count();
+    info.content_hash = metadata.etag();
+    for (const auto& entry : metadata.metadata()) {
+      info.metadata.emplace(entry.first, entry.second);
+    }
+    result->emplace_back(name.substr(prefix.size()), std::move(info));
+  }
+  return IOStatus::OK();
 }
 
 IOStatus GcsStorageProvider::DeleteCloudObject(std::string const& bucket_name,

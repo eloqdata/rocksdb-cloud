@@ -107,8 +107,8 @@ class EloqPurger {
    */
   bool RunSinglePurgeCycle();
 
-  // Selection logic. Pure functions over in-memory state (no cloud IO);
-  // public so unit tests can exercise them directly.
+  // In-memory selection helpers (no cloud IO). They append decisions and emit
+  // diagnostic logs; public so unit tests can exercise them directly.
   void SelectObsoleteSSTFilesWithThreshold(
       const PurgerAllFiles &all_files, const PurgerLiveFileSet &live_files,
       const PurgerFileNumberThresholds &thresholds, uint64_t s3_current_time,
@@ -134,9 +134,9 @@ class EloqPurger {
   bool dry_run_;
   uint64_t cloudmanifest_retention_ms_;
   // Minimum object age before a non-live file in a dead epoch (an epoch that
-  // is no loaded CLOUDMANIFEST's current epoch) may be deleted. Covers the
-  // race with a node mid-open/mid-branch-creation whose files were uploaded
-  // before our listing but whose CLOUDMANIFEST landed after it.
+  // is not any loaded CLOUDMANIFEST's current epoch) may be deleted. Covers
+  // the race with a node mid-open/mid-branch-creation whose files were
+  // uploaded before our listing but whose CLOUDMANIFEST landed after it.
   uint64_t dead_epoch_file_age_ms_;
   // Upper bound on deletions per cycle; the remainder is re-selected next
   // cycle. 0 means unlimited.

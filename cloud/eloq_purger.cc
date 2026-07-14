@@ -97,6 +97,7 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
       bucket_name_, object_key, temp_file_path);
 
   if (!s.ok()) {
+    std::remove(temp_file_path.c_str());
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
         "Failed to read smallest file number from S3: %s, object_key: %s, ",
         s.ToString().c_str(), object_key.c_str());
@@ -109,10 +110,10 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
       *file_number = std::numeric_limits<uint64_t>::min();
       return Status::IOError(s.ToString());
     }
-    // NotFound: for snapshots and branching, the smallest file number object
-    // legitimately might not exist yet. Such an epoch has no writer, so
-    // nothing is in flight and the max file number from the MANIFEST file is
-    // a safe threshold.
+    // NotFound is safe only under the deployment contract that every writable
+    // DBCloud publishes this guard before uploading SSTs. Marker absence then
+    // identifies a snapshot/branch epoch with no active writer, so the maximum
+    // file number from its MANIFEST is a safe threshold.
     uint64_t manifest_max_file_number = 0;
     const std::string manifest_file_name = ManifestFileWithEpoch(epoch_);
     Status status = ManifestReader::GetMaxFileNumberFromManifest(

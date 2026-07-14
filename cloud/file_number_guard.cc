@@ -482,8 +482,9 @@ Status CloudFileSystemImpl::BlockPurger() {
   if (publisher) {
     return publisher->BlockPurger();
   }
-  // No publisher registered (guard disabled): one-shot sentinel with no
-  // ordering concerns, since nothing else on this node writes the object.
+  // No publisher is installed: write a one-shot sentinel that remains until
+  // an external writer replaces it. The embedder owns that lifetime because
+  // there is no local scheduler to publish a finite threshold.
   auto *manifest = GetCloudManifest();
   if (manifest == nullptr) {
     return Status::InvalidArgument(
