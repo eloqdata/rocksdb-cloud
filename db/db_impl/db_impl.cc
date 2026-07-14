@@ -6344,8 +6344,17 @@ Status DBImpl::IngestExternalFiles(
       static_cast<ColumnFamilyHandleImpl*>(args[0].column_family)->cfd(), total,
       pending_output_elem, &next_file_number);
   if (!status.ok()) {
-    InstrumentedMutexLock l(&mutex_);
-    ReleaseFileNumberFromPendingOutputs(pending_output_elem);
+    const bool file_numbers_reserved = pending_output_elem != nullptr;
+    if (file_numbers_reserved) {
+      NotifyOnExternalFileIngestionStarted(next_file_number, total);
+    }
+    {
+      InstrumentedMutexLock l(&mutex_);
+      ReleaseFileNumberFromPendingOutputs(pending_output_elem);
+    }
+    if (file_numbers_reserved) {
+      NotifyOnExternalFileIngestionFinished(next_file_number, total);
+    }
     return status;
   }
   NotifyOnExternalFileIngestionStarted(next_file_number, total);

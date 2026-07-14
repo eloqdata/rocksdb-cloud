@@ -94,10 +94,15 @@ IOStatus CopyFile(FileSystem* fs, const std::string& source,
 
   io_s = CopyFile(fs, source, src_temp_hint, dest_writer, size, use_fsync,
                   io_tracer);
-  if (!io_s.ok()) {
-    return io_s;
+  if (io_s.ok()) {
+    io_s = dest_writer->Close(IOOptions());
+  } else {
+    dest_writer->Close(IOOptions()).PermitUncheckedError();
   }
-  return dest_writer->Close(IOOptions());
+  if (!io_s.ok()) {
+    fs->DeleteFile(destination, IOOptions(), nullptr).PermitUncheckedError();
+  }
+  return io_s;
 }
 
 // Utility function to create a file with the provided contents

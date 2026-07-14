@@ -2318,6 +2318,15 @@ TEST_P(ExternSSTFileLinkFailFallbackTest, CopyCloseFailureIsPropagated) {
   ASSERT_TRUE(status.IsIOError());
   ASSERT_NE(status.ToString().find("injected close failure"),
             std::string::npos);
+
+  std::vector<std::string> files;
+  ASSERT_OK(env_->GetChildren(dbname_, &files));
+  for (const auto& file : files) {
+    uint64_t number;
+    FileType type;
+    ASSERT_FALSE(ParseFileName(file, &number, &type) && type == kTableFile)
+        << "partial destination left behind: " << file;
+  }
 }
 
 class TestIngestExternalFileListener : public EventListener {
@@ -2341,6 +2350,31 @@ class TestIngestExternalFileListener : public EventListener {
   std::vector<uint64_t> finished_file_numbers;
   std::vector<ExternalFileIngestionInfo> ingested_files;
 };
+
+TEST_P(ExternalSSTFileTest, ReservationManifestFailureBalancesLifecycle) {
+  auto fault_injection_env = std::make_unique<FaultInjectionTestEnv>(env_);
+  Options options = CurrentOptions();
+  options.env = fault_injection_env.get();
+  auto listener = std::make_shared<TestIngestExternalFileListener>();
+  options.listeners.emplace_back(listener);
+  DestroyAndReopen(options);
+
+  std::vector<std::pair<std::string, std::string>> data{{"key", "value"}};
+  std::string file_path;
+  ASSERT_OK(GenerateOneExternalFile(
+      options, db_->DefaultColumnFamily(), data, -1, false /*sort_data*/,
+      &file_path, nullptr /*true_data*/));
+
+  fault_injection_env->SetFilesystemActive(false);
+  Status status = db_->IngestExternalFile({file_path},
+                                          IngestExternalFileOptions());
+  fault_injection_env->SetFilesystemActive(true);
+
+  ASSERT_NOK(status);
+  ASSERT_EQ(listener->started_file_numbers.size(), 1);
+  ASSERT_EQ(listener->finished_file_numbers, listener->started_file_numbers);
+  Close();
+}
 
 TEST_P(ExternalSSTFileTest, IngestionListener) {
   Options options = CurrentOptions();
