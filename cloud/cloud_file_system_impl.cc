@@ -2346,6 +2346,12 @@ Status CloudFileSystemImpl::CheckValidity() const {
              cloud_fs_options.dest_bucket.GetObjectPath().empty()) {
     return Status::InvalidArgument(
         "Must specify both dest bucket name and path");
+  } else if (cloud_fs_options.guard_publish_interval.count() <= 0) {
+    return Status::InvalidArgument(
+        "guard_publish_interval_ms must be greater than zero");
+  } else if (cloud_fs_options.guard_entry_duration.count() <= 0) {
+    return Status::InvalidArgument(
+        "guard_entry_duration_ms must be greater than zero");
   } else if (!cloud_fs_options.storage_provider) {
     return Status::InvalidArgument(
         "Cloud environment requires a storage provider");

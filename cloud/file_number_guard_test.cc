@@ -38,7 +38,9 @@
 #include "rocksdb/cloud/cloud_file_system_impl.h"
 #include "rocksdb/cloud/cloud_storage_provider.h"
 #include "rocksdb/cloud/cloud_storage_provider_impl.h"
+#include "rocksdb/convenience.h"
 #include "rocksdb/env.h"
+#include "rocksdb/utilities/options_type.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 
@@ -209,6 +211,76 @@ TEST(FileNumberGuardKeyTest, KeyFormatIsStable) {
             "smallest_new_file_number-e");
   ASSERT_EQ(std::string(kSmallestFileNumberFilePrefix),
             "smallest_new_file_number-");
+}
+
+// ---------------- Cloud file system option tests ----------------
+
+TEST(CloudFileSystemGuardOptionsTest, DurationsRoundTripInMilliseconds) {
+  ConfigOptions config_options;
+  CloudFileSystemOptions options;
+
+  ASSERT_OK(options.Configure(
+      config_options,
+      "guard_publish_interval_ms=1234;guard_entry_duration_ms=5678"));
+  ASSERT_EQ(options.guard_publish_interval, std::chrono::milliseconds(1234));
+  ASSERT_EQ(options.guard_entry_duration, std::chrono::milliseconds(5678));
+
+  std::string serialized;
+  ASSERT_OK(options.Serialize(config_options, &serialized));
+  CloudFileSystemOptions copy;
+  ASSERT_OK(copy.Configure(config_options, serialized));
+  ASSERT_EQ(copy.guard_publish_interval, std::chrono::milliseconds(1234));
+  ASSERT_EQ(copy.guard_entry_duration, std::chrono::milliseconds(5678));
+}
+
+TEST(CloudFileSystemGuardOptionsTest, DurationsParticipateInEquality) {
+  ConfigOptions config_options;
+  CloudFileSystemOptions expected;
+  CloudFileSystemOptions actual;
+  std::string mismatch;
+
+  actual.guard_publish_interval = std::chrono::milliseconds(1);
+  ASSERT_FALSE(OptionTypeInfo::TypesAreEqual(
+      config_options, CloudFileSystemOptions::cloud_fs_option_type_info,
+      &expected, &actual, &mismatch));
+  ASSERT_EQ(mismatch, "guard_publish_interval_ms");
+
+  actual = expected;
+  actual.guard_entry_duration = std::chrono::milliseconds(1);
+  mismatch.clear();
+  ASSERT_FALSE(OptionTypeInfo::TypesAreEqual(
+      config_options, CloudFileSystemOptions::cloud_fs_option_type_info,
+      &expected, &actual, &mismatch));
+  ASSERT_EQ(mismatch, "guard_entry_duration_ms");
+}
+
+TEST(CloudFileSystemGuardOptionsTest, DurationsMustBePositive) {
+  auto validate = [](std::chrono::milliseconds publish_interval,
+                     std::chrono::milliseconds entry_duration) {
+    CloudFileSystemOptions options;
+    options.storage_provider = std::make_shared<RecordingStorageProvider>();
+    options.guard_publish_interval = publish_interval;
+    options.guard_entry_duration = entry_duration;
+    CloudFileSystemImpl cfs(options, FileSystem::Default(), nullptr);
+    return cfs.ValidateOptions(DBOptions(), ColumnFamilyOptions());
+  };
+
+  for (int value : {0, -1}) {
+    Status status = validate(std::chrono::milliseconds(value),
+                             std::chrono::milliseconds(1));
+    ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+    ASSERT_NE(status.ToString().find("guard_publish_interval_ms"),
+              std::string::npos);
+
+    status = validate(std::chrono::milliseconds(1),
+                      std::chrono::milliseconds(value));
+    ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+    ASSERT_NE(status.ToString().find("guard_entry_duration_ms"),
+              std::string::npos);
+  }
+
+  ASSERT_OK(validate(std::chrono::milliseconds(1),
+                     std::chrono::milliseconds(1)));
 }
 
 // ---------------- Publisher tests ----------------

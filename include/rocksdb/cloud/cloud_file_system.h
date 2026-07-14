@@ -460,12 +460,14 @@ class CloudFileSystemOptions {
   // publish the guard themselves).
   bool publish_file_number_guard{false};
 
-  // Interval of the periodic (upward) publish of the file number guard.
+  // Interval of the periodic (upward) publish of the file number guard,
+  // configured as guard_publish_interval_ms. Must be greater than zero.
   // Default: 30 seconds.
   std::chrono::milliseconds guard_publish_interval{std::chrono::seconds(30)};
 
   // How long a completed job's entry keeps holding the guard down before it
   // expires, giving the job's MANIFEST update time to reach the cloud.
+  // Configured as guard_entry_duration_ms and must be greater than zero.
   // Default: 15 seconds.
   std::chrono::milliseconds guard_entry_duration{std::chrono::seconds(15)};
 

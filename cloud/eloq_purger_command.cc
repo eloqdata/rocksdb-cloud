@@ -231,6 +231,10 @@ int main(int argc, char **argv) {
                  "actually delete files\n";
     std::cerr << "  --aws_region=ap-northeast-1            AWS region\n";
     std::cerr << "  --cloudmanifest_retention_ms=3600000   CLOUDMANIFEST retention time in milliseconds\n";
+    std::cerr << "  --dead_epoch_file_age_ms=3600000       Minimum age before "
+                 "deleting a non-live file in a dead epoch\n";
+    std::cerr << "  --max_deletions_per_cycle=10000        Maximum objects "
+                 "deleted per cycle; 0 means unlimited\n";
     return 1;
   }
 
