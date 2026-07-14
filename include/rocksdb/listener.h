@@ -373,6 +373,8 @@ struct FlushJobInfo {
 // FlushJobInfo, this is reported for failed flushes and successful mempurges
 // that produce no SST.
 struct FlushJobEndInfo {
+  ~FlushJobEndInfo() { status.PermitUncheckedError(); }
+
   // The id of the thread that ran the flush job.
   uint64_t thread_id;
   // The job id, which is unique in the same thread.
