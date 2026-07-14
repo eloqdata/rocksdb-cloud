@@ -30,6 +30,8 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "cloud/cloud_manifest.h"
@@ -49,12 +51,18 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 
 constexpr uint64_t kMax = std::numeric_limits<uint64_t>::max();
+constexpr auto kAsyncWaitTimeout = std::chrono::seconds(5);
 
 // Records every PutCloudObject; everything else is unsupported. The
 // publisher only ever needs PUT.
 class RecordingStorageProvider : public CloudStorageProvider {
  public:
   const char *Name() const override { return "recording"; }
+
+  void SetPutStatus(const std::string &object_path, IOStatus status) {
+    std::lock_guard<std::mutex> lk(mu_);
+    put_statuses_[object_path] = std::move(status);
+  }
 
   IOStatus PutCloudObject(const std::string &local_path,
                           const std::string & /*bucket_name*/,
@@ -66,6 +74,10 @@ class RecordingStorageProvider : public CloudStorageProvider {
                         std::istreambuf_iterator<char>());
     std::lock_guard<std::mutex> lk(mu_);
     ++put_count_;
+    auto status = put_statuses_.find(object_path);
+    if (status != put_statuses_.end() && !status->second.ok()) {
+      return status->second;
+    }
     objects_[object_path] = content;
     return IOStatus::OK();
   }
@@ -160,6 +172,7 @@ class RecordingStorageProvider : public CloudStorageProvider {
 
   std::mutex mu_;
   int put_count_ = 0;
+  std::unordered_map<std::string, IOStatus> put_statuses_;
   std::unordered_map<std::string, std::string> objects_;
 };
 
@@ -661,12 +674,21 @@ TEST_F(FileNumberGuardTest, StopDuringGuardPublishPreventsSstUpload) {
   std::condition_variable cv;
   bool guard_put_reached = false;
   bool release_guard_put = false;
+  bool guard_put_wait_timed_out = false;
+  bool stop_reached = false;
   SyncPoint::GetInstance()->SetCallBack(
       "FileNumberGuard::PutSmallestFileNumberObject:Status", [&](void *) {
         std::unique_lock<std::mutex> lock(mutex);
         guard_put_reached = true;
         cv.notify_all();
-        cv.wait(lock, [&] { return release_guard_put; });
+        guard_put_wait_timed_out = !cv.wait_for(
+            lock, kAsyncWaitTimeout, [&] { return release_guard_put; });
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "FileNumberGuardPublisher::Stop:Stopped", [&](void *) {
+        std::lock_guard<std::mutex> lock(mutex);
+        stop_reached = true;
+        cv.notify_all();
       });
   SyncPoint::GetInstance()->EnableProcessing();
 
@@ -681,10 +703,17 @@ TEST_F(FileNumberGuardTest, StopDuringGuardPublishPreventsSstUpload) {
                           [&] { return file.Close(IOOptions(), nullptr); });
   {
     std::unique_lock<std::mutex> lock(mutex);
-    cv.wait(lock, [&] { return guard_put_reached; });
+    ASSERT_TRUE(cv.wait_for(lock, kAsyncWaitTimeout,
+                            [&] { return guard_put_reached; }));
   }
   auto stop = std::async(std::launch::async, [&] { pub->Stop(); });
-  const auto stop_state = stop.wait_for(std::chrono::milliseconds(100));
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(cv.wait_for(lock, kAsyncWaitTimeout,
+                            [&] { return stop_reached; }));
+  }
+  ASSERT_EQ(stop.wait_for(std::chrono::milliseconds(0)),
+            std::future_status::timeout);
 
   {
     std::lock_guard<std::mutex> lock(mutex);
@@ -694,7 +723,7 @@ TEST_F(FileNumberGuardTest, StopDuringGuardPublishPreventsSstUpload) {
   const IOStatus close_status = close.get();
   stop.get();
 
-  ASSERT_EQ(stop_state, std::future_status::timeout);
+  ASSERT_FALSE(guard_put_wait_timed_out);
   ASSERT_NOK(close_status);
   ASSERT_FALSE(provider_->HasObject(object_path));
 }
@@ -712,6 +741,8 @@ TEST_F(FileNumberGuardTest, StopWaitsForProtectedSstUpload) {
   std::condition_variable cv;
   bool upload_reached = false;
   bool release_upload = false;
+  bool upload_wait_timed_out = false;
+  bool stop_reached = false;
   SyncPoint::GetInstance()->SetCallBack(
       "FileNumberGuardTest::PutCloudObject", [&](void *arg) {
         if (*static_cast<std::string *>(arg) != object_path) {
@@ -720,7 +751,14 @@ TEST_F(FileNumberGuardTest, StopWaitsForProtectedSstUpload) {
         std::unique_lock<std::mutex> lock(mutex);
         upload_reached = true;
         cv.notify_all();
-        cv.wait(lock, [&] { return release_upload; });
+        upload_wait_timed_out = !cv.wait_for(
+            lock, kAsyncWaitTimeout, [&] { return release_upload; });
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "FileNumberGuardPublisher::Stop:Stopped", [&](void *) {
+        std::lock_guard<std::mutex> lock(mutex);
+        stop_reached = true;
+        cv.notify_all();
       });
   SyncPoint::GetInstance()->EnableProcessing();
 
@@ -733,10 +771,17 @@ TEST_F(FileNumberGuardTest, StopWaitsForProtectedSstUpload) {
                           [&] { return file.Close(IOOptions(), nullptr); });
   {
     std::unique_lock<std::mutex> lock(mutex);
-    cv.wait(lock, [&] { return upload_reached; });
+    ASSERT_TRUE(cv.wait_for(lock, kAsyncWaitTimeout,
+                            [&] { return upload_reached; }));
   }
   auto stop = std::async(std::launch::async, [&] { pub->Stop(); });
-  const auto stop_state = stop.wait_for(std::chrono::milliseconds(100));
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(cv.wait_for(lock, kAsyncWaitTimeout,
+                            [&] { return stop_reached; }));
+  }
+  ASSERT_EQ(stop.wait_for(std::chrono::milliseconds(0)),
+            std::future_status::timeout);
 
   {
     std::lock_guard<std::mutex> lock(mutex);
@@ -746,7 +791,7 @@ TEST_F(FileNumberGuardTest, StopWaitsForProtectedSstUpload) {
   ASSERT_OK(close.get());
   stop.get();
 
-  ASSERT_EQ(stop_state, std::future_status::timeout);
+  ASSERT_FALSE(upload_wait_timed_out);
   ASSERT_TRUE(provider_->HasObject(object_path));
 }
 
@@ -766,6 +811,47 @@ TEST_F(FileNumberGuardTest, GuardEnabledIdentityUploadPassesThrough) {
   ASSERT_OK(file.Close(IOOptions(), nullptr));
   ASSERT_TRUE(provider_->HasObject(object_path));
   ASSERT_EQ(provider_->PutCount(), 1);
+}
+
+TEST_F(FileNumberGuardTest, MalformedEpochSstUploadFailsClosed) {
+  LoadManifestWithEpoch("epoch1");
+  auto pub = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+  cfs_->SetFileNumberGuardPublisher(pub);
+
+  const std::string local_path = tmp_dir_ + "/not-a-number.sst-epoch1";
+  const std::string object_path = "dbpath/not-a-number.sst-epoch1";
+  CloudStorageWritableFileImpl file(cfs_.get(), local_path, "guard-bucket",
+                                    object_path, FileOptions());
+  ASSERT_OK(file.status());
+  ASSERT_OK(file.Append(Slice("sst contents"), IOOptions(), nullptr));
+
+  const IOStatus status = file.Close(IOOptions(), nullptr);
+  ASSERT_TRUE(status.IsInvalidArgument()) << status.ToString();
+  ASSERT_FALSE(provider_->HasObject(object_path));
+  ASSERT_EQ(provider_->PutCount(), 0);
+}
+
+TEST_F(FileNumberGuardTest, ProtectedSstUploadFailurePropagates) {
+  LoadManifestWithEpoch("epoch1");
+  auto pub = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+  ASSERT_OK(pub->OnJobBegin(123, 1, 1));
+  cfs_->SetFileNumberGuardPublisher(pub);
+
+  const std::string local_path = tmp_dir_ + "/000123.sst-epoch1";
+  const std::string object_path = "dbpath/000123.sst-epoch1";
+  provider_->SetPutStatus(object_path,
+                          IOStatus::IOError("injected SST upload failure"));
+  CloudStorageWritableFileImpl file(cfs_.get(), local_path, "guard-bucket",
+                                    object_path, FileOptions());
+  ASSERT_OK(file.status());
+  ASSERT_OK(file.Append(Slice("sst contents"), IOOptions(), nullptr));
+
+  const IOStatus status = file.Close(IOOptions(), nullptr);
+  ASSERT_TRUE(status.IsIOError()) << status.ToString();
+  ASSERT_FALSE(provider_->HasObject(object_path));
+  ASSERT_EQ(provider_->Content(GuardKey()), "123");
 }
 
 }  //  namespace ROCKSDB_NAMESPACE

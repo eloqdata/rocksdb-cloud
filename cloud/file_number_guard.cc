@@ -188,6 +188,7 @@ void FileNumberGuardPublisher::Stop() {
     }
   }
   if (notify) {
+    TEST_SYNC_POINT("FileNumberGuardPublisher::Stop:Stopped");
     stop_cv_.notify_all();
   }
   if (handle >= 0) {
