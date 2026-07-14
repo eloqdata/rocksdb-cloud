@@ -1472,11 +1472,15 @@ class DBImpl : public DB {
 
   void NotifyOnFlushBegin(ColumnFamilyData* cfd, FileMetaData* file_meta,
                           const MutableCFOptions& mutable_cf_options,
-                          int job_id, FlushReason flush_reason);
+                          int job_id, FlushReason flush_reason,
+                          uint64_t file_number);
 
   void NotifyOnFlushCompleted(
       ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
       std::list<std::unique_ptr<FlushJobInfo>>* flush_jobs_info);
+
+  void NotifyOnFlushFinished(int job_id, const Status& status,
+                             bool switched_to_mempurge);
 
   void NotifyOnCompactionBegin(ColumnFamilyData* cfd, Compaction* c,
                                const Status& st,

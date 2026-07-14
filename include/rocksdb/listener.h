@@ -369,6 +369,21 @@ struct FlushJobInfo {
   std::vector<BlobFileAdditionInfo> blob_file_addition_infos;
 };
 
+// Information about the terminal outcome of a flush attempt. Unlike
+// FlushJobInfo, this is reported for failed flushes and successful mempurges
+// that produce no SST.
+struct FlushJobEndInfo {
+  // The id of the thread that ran the flush job.
+  uint64_t thread_id;
+  // The job id, which is unique in the same thread.
+  int job_id;
+  // The final status after the flush result was installed or rolled back.
+  Status status;
+  // True when the job completed by replacing its input with a mempurged
+  // memtable instead of creating an SST.
+  bool switched_to_mempurge;
+};
+
 struct CompactionFileInfo {
   // The level of the file.
   int level;
@@ -594,6 +609,13 @@ class EventListener : public Customizable {
   // returns.  Otherwise, RocksDB may be blocked.
   virtual void OnFlushBegin(DB* /*db*/,
                             const FlushJobInfo& /*flush_job_info*/) {}
+
+  // Called exactly once after every flush attempt whose OnFlushBegin callback
+  // was issued, after its final status is known. This includes failures and
+  // successful mempurges; OnFlushCompleted remains success-only and is not
+  // called for mempurges because they produce no SST.
+  virtual void OnFlushFinished(DB* /*db*/,
+                               const FlushJobEndInfo& /*flush_job_end_info*/) {}
 
   // A callback function for RocksDB which will be called whenever
   // a SST file is deleted.  Different from OnCompactionCompleted and

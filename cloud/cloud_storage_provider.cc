@@ -5,6 +5,7 @@
 
 #include <cinttypes>
 
+#include "cloud/file_number_guard.h"
 #include "cloud/filename.h"
 #include "file/filename.h"
 #include "rocksdb/cloud/cloud_file_system.h"
@@ -176,6 +177,26 @@ IOStatus CloudStorageWritableFileImpl::Close(const IOOptions& opts,
   local_file_.reset();
 
   if (!is_manifest_) {
+    auto* cfs_impl = dynamic_cast<CloudFileSystemImpl*>(cfs_);
+    if (cfs_impl != nullptr) {
+      auto publisher = cfs_impl->GetFileNumberGuardPublisher();
+      if (publisher) {
+        uint64_t file_number = 0;
+        FileType file_type;
+        const std::string logical_name = basename(RemoveEpoch(fname_));
+        if (!ParseFileName(logical_name, &file_number, &file_type) ||
+            file_type != kTableFile) {
+          status_ = IOStatus::InvalidArgument("cannot parse SST file number",
+                                              logical_name);
+          return status_;
+        }
+        status_ =
+            status_to_io_status(publisher->ProtectFileUpload(file_number));
+        if (!status_.ok()) {
+          return status_;
+        }
+      }
+    }
     status_ = cfs_->CopyLocalFileToDest(fname_, cloud_fname_);
     if (!status_.ok()) {
       Log(InfoLogLevel::ERROR_LEVEL, cfs_->GetLogger(),

@@ -61,10 +61,19 @@ class ConstantSizeSstFileManager : public SstFileManagerImpl {
 };
 }  // namespace
 
-DBCloudImpl::DBCloudImpl(DB* db, std::unique_ptr<Env> local_env)
-    : DBCloud(db), cfs_(nullptr), local_env_(std::move(local_env)) {}
+DBCloudImpl::DBCloudImpl(DB* db, std::unique_ptr<Env> local_env,
+                         CloudFileSystemImpl* cfs)
+    : DBCloud(db), cfs_(cfs), local_env_(std::move(local_env)) {}
 
 DBCloudImpl::~DBCloudImpl() {
+  if (cfs_ != nullptr) {
+    auto publisher = cfs_->GetFileNumberGuardPublisher();
+    if (publisher) {
+      // Keep the stopped gate installed so SST Close calls during wrapped-DB
+      // destruction fail instead of bypassing protection.
+      publisher->Stop();
+    }
+  }
   warm_up_is_running_.store(false, std::memory_order_release);
   for (auto& thd : warm_up_threads_) {
     if (thd.joinable()) {
@@ -266,7 +275,8 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
   }
 
   if (st.ok()) {
-    DBCloudImpl* cloud = new DBCloudImpl(db, std::move(local_env));
+    DBCloudImpl* cloud = new DBCloudImpl(
+        db, std::move(local_env), dynamic_cast<CloudFileSystemImpl*>(cfs));
     *dbptr = cloud;
     db->GetDbIdentity(dbid);
   }

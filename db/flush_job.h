@@ -93,6 +93,10 @@ class FlushJob {
   void Cancel();
   const autovector<MemTable*>& GetMemTables() const { return mems_; }
 
+  // Returns the output file number allocated by PickMemTable(), or zero when
+  // no output was allocated.
+  uint64_t GetFileNumber() const { return meta_.fd.GetNumber(); }
+
   std::list<std::unique_ptr<FlushJobInfo>>* GetCommittedFlushJobsInfo() {
     return &committed_flush_jobs_info_;
   }

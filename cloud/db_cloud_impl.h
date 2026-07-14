@@ -16,6 +16,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 class Env;
+class CloudFileSystemImpl;
 
 //
 // All writes to this DB can be configured to be persisted
@@ -36,8 +37,9 @@ class DBCloudImpl : public DBCloud {
   Status GetCurrentEpoch(std::string *epoch) const override;
 
  protected:
-  // The CloudFileSystem used by this open instance.
-  CloudFileSystem* cfs_;
+  // Non-owning; the environment keeps the CloudFileSystem alive through DB
+  // teardown.
+  CloudFileSystemImpl* cfs_;
 
  private:
   Status DoCheckpointToCloud(const BucketOptions& destination,
@@ -46,7 +48,7 @@ class DBCloudImpl : public DBCloud {
   // Maximum manifest file size
   static const uint64_t max_manifest_file_size = 4 * 1024L * 1024L;
 
-  DBCloudImpl(DB* db, std::unique_ptr<Env> local_env);
+  DBCloudImpl(DB* db, std::unique_ptr<Env> local_env, CloudFileSystemImpl* cfs);
 
   std::unique_ptr<Env> local_env_;
 

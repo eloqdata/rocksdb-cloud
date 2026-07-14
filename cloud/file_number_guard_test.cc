@@ -23,7 +23,9 @@
 #include "cloud/file_number_guard.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <memory>
 #include <string>
@@ -35,6 +37,7 @@
 #include "rocksdb/cloud/cloud_file_system.h"
 #include "rocksdb/cloud/cloud_file_system_impl.h"
 #include "rocksdb/cloud/cloud_storage_provider.h"
+#include "rocksdb/cloud/cloud_storage_provider_impl.h"
 #include "rocksdb/env.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
@@ -72,6 +75,11 @@ class RecordingStorageProvider : public CloudStorageProvider {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = objects_.find(key);
     return it == objects_.end() ? "" : it->second;
+  }
+
+  bool HasObject(const std::string &key) {
+    std::lock_guard<std::mutex> lk(mu_);
+    return objects_.find(key) != objects_.end();
   }
 
   // -- everything below is unused by the publisher --
@@ -250,6 +258,16 @@ class FileNumberGuardTest : public testing::Test {
   std::unique_ptr<CloudFileSystemImpl> cfs_;
 };
 
+TEST_F(FileNumberGuardTest, JobRegistrationDoesNotPublish) {
+  LoadManifestWithEpoch("epoch1");
+  FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
+                               std::chrono::seconds(15));
+
+  ASSERT_OK(pub.OnJobBegin(42, 1, 1));
+  ASSERT_EQ(provider_->PutCount(), 0);
+  ASSERT_EQ(pub.TEST_LastPublished(), kMax);
+}
+
 TEST_F(FileNumberGuardTest, SentinelDoesNotAdvanceWatermark) {
   LoadManifestWithEpoch("epoch1");
   FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
@@ -263,6 +281,8 @@ TEST_F(FileNumberGuardTest, SentinelDoesNotAdvanceWatermark) {
 
   // First job after the sentinel publishes its (smaller-than-MAX) snapshot.
   ASSERT_OK(pub.OnJobBegin(42, 1, 1));
+  ASSERT_EQ(provider_->Content(GuardKey()), "0");
+  ASSERT_OK(pub.ProtectFileUpload(42));
   ASSERT_EQ(provider_->Content(GuardKey()), "42");
   ASSERT_EQ(pub.TEST_LastPublished(), 42u);
 }
@@ -290,6 +310,8 @@ TEST_F(FileNumberGuardTest, DownwardPublishTriggerCondition) {
                                std::chrono::seconds(15));
 
   ASSERT_OK(pub.OnJobBegin(100, 1, 1));
+  ASSERT_EQ(provider_->PutCount(), 0);
+  ASSERT_OK(pub.ProtectFileUpload(100));
   int puts_after_first = provider_->PutCount();
   ASSERT_EQ(provider_->Content(GuardKey()), "100");
 
@@ -300,8 +322,84 @@ TEST_F(FileNumberGuardTest, DownwardPublishTriggerCondition) {
 
   // A job below the watermark publishes synchronously.
   ASSERT_OK(pub.OnJobBegin(50, 4, 4));
+  ASSERT_OK(pub.ProtectFileUpload(50));
   ASSERT_EQ(provider_->Content(GuardKey()), "50");
   ASSERT_EQ(pub.TEST_LastPublished(), 50u);
+}
+
+TEST_F(FileNumberGuardTest, ProtectPublishesLiveWindowMinimum) {
+  LoadManifestWithEpoch("epoch1");
+  FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
+                               std::chrono::seconds(15));
+
+  ASSERT_OK(pub.OnJobBegin(100, 1, 1));
+  ASSERT_OK(pub.OnJobBegin(200, 2, 2));
+  ASSERT_OK(pub.ProtectFileUpload(200));
+
+  ASSERT_EQ(provider_->Content(GuardKey()), "100");
+  ASSERT_EQ(pub.TEST_LastPublished(), 100u);
+}
+
+TEST_F(FileNumberGuardTest, ProtectWaitsForInFlightUpwardPublish) {
+  LoadManifestWithEpoch("epoch1");
+  FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
+                               std::chrono::milliseconds(0));
+
+  ASSERT_OK(pub.OnJobBegin(50, 1, 1));
+  ASSERT_OK(pub.ProtectFileUpload(50));
+  pub.OnJobEnd(1, 1);
+  ASSERT_OK(pub.OnJobBegin(100, 2, 2));
+
+  std::mutex block_mutex;
+  std::condition_variable block_cv;
+  bool upward_put_reached = false;
+  bool release_upward_put = false;
+  SyncPoint::GetInstance()->SetCallBack(
+      "FileNumberGuard::PutSmallestFileNumberObject:Status", [&](void*) {
+        if (provider_->Content(GuardKey()) != "100") {
+          return;
+        }
+        std::unique_lock<std::mutex> lock(block_mutex);
+        upward_put_reached = true;
+        block_cv.notify_all();
+        block_cv.wait(lock, [&] { return release_upward_put; });
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  std::thread periodic([&] { pub.PeriodicPublish(); });
+  {
+    std::unique_lock<std::mutex> lock(block_mutex);
+    block_cv.wait(lock, [&] { return upward_put_reached; });
+  }
+
+  ASSERT_OK(pub.OnJobBegin(60, 3, 3));
+  auto protection = std::async(std::launch::async,
+                               [&] { return pub.ProtectFileUpload(60); });
+  const auto state = protection.wait_for(std::chrono::milliseconds(100));
+
+  {
+    std::lock_guard<std::mutex> lock(block_mutex);
+    release_upward_put = true;
+  }
+  block_cv.notify_all();
+  periodic.join();
+  Status protection_status = protection.get();
+
+  ASSERT_EQ(state, std::future_status::timeout);
+  ASSERT_OK(protection_status);
+  ASSERT_EQ(provider_->Content(GuardKey()), "60");
+  ASSERT_EQ(pub.TEST_LastPublished(), 60u);
+}
+
+TEST_F(FileNumberGuardTest, ProtectRejectsMissingOrTooHighWindow) {
+  LoadManifestWithEpoch("epoch1");
+  FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
+                               std::chrono::seconds(15));
+
+  ASSERT_TRUE(pub.ProtectFileUpload(100).IsInvalidArgument());
+  ASSERT_OK(pub.OnJobBegin(200, 1, 1));
+  ASSERT_TRUE(pub.ProtectFileUpload(100).IsInvalidArgument());
+  ASSERT_EQ(provider_->PutCount(), 0);
 }
 
 TEST_F(FileNumberGuardTest, PeriodicPublishesWindowMinThenMaxWhenIdle) {
@@ -310,7 +408,8 @@ TEST_F(FileNumberGuardTest, PeriodicPublishesWindowMinThenMaxWhenIdle) {
   FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
                                std::chrono::milliseconds(50));
 
-  ASSERT_OK(pub.OnJobBegin(100, 1, 1));  // publishes 100 downward
+  ASSERT_OK(pub.OnJobBegin(100, 1, 1));
+  ASSERT_OK(pub.ProtectFileUpload(100));  // publishes 100 downward
   ASSERT_OK(pub.OnJobBegin(200, 2, 2));  // no publish
 
   // Window min is 100 == last published: periodic publish is a no-op.
@@ -357,10 +456,9 @@ TEST_F(FileNumberGuardTest, DownwardPublishFailureRetriesWithoutAdvancing) {
 
   // Run the downward publish on a separate thread: it blocks (retrying)
   // until the PUT succeeds.
-  std::thread job([&] {
-    Status s = pub.OnJobBegin(10, 1, 1);
-    ASSERT_OK(s);
-  });
+  ASSERT_OK(pub.OnJobBegin(10, 1, 1));
+  Status job_status;
+  std::thread job([&] { job_status = pub.ProtectFileUpload(10); });
 
   // While failures are being injected, the watermark must not advance.
   while (failures_left.load() > 0) {
@@ -369,6 +467,7 @@ TEST_F(FileNumberGuardTest, DownwardPublishFailureRetriesWithoutAdvancing) {
   }
   job.join();
 
+  ASSERT_OK(job_status);
   ASSERT_GE(attempts.load(), 3);  // two failures + at least one success
   ASSERT_EQ(pub.TEST_LastPublished(), 10u);
   ASSERT_EQ(provider_->Content(GuardKey()), "10");
@@ -388,8 +487,9 @@ TEST_F(FileNumberGuardTest, StopUnblocksFailingDownwardPublish) {
 
   std::atomic<bool> returned{false};
   Status job_status;
+  ASSERT_OK(pub.OnJobBegin(10, 1, 1));
   std::thread job([&] {
-    job_status = pub.OnJobBegin(10, 1, 1);
+    job_status = pub.ProtectFileUpload(10);
     returned = true;
   });
 
@@ -413,7 +513,8 @@ TEST_F(FileNumberGuardTest, EmptyEpochPublishRefused) {
   FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
                                std::chrono::seconds(15));
 
-  ASSERT_TRUE(pub.OnJobBegin(10, 1, 1).IsInvalidArgument());
+  ASSERT_OK(pub.OnJobBegin(10, 1, 1));
+  ASSERT_TRUE(pub.ProtectFileUpload(10).IsInvalidArgument());
   ASSERT_TRUE(pub.BlockPurger().IsInvalidArgument());
   pub.PeriodicPublish();
   ASSERT_EQ(provider_->PutCount(), 0);
@@ -433,6 +534,7 @@ TEST_F(FileNumberGuardTest, StartStopSchedulerSmoke) {
       std::chrono::milliseconds(10));
   pub->Start();
   ASSERT_OK(pub->OnJobBegin(7, 1, 1));
+  ASSERT_OK(pub->ProtectFileUpload(7));
   pub->OnJobEnd(1, 1);
   // Let the recurring job run at least once (idle -> MAX eventually).
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -441,6 +543,37 @@ TEST_F(FileNumberGuardTest, StartStopSchedulerSmoke) {
   std::this_thread::sleep_for(std::chrono::milliseconds(60));
   // No publishes after Stop.
   ASSERT_EQ(provider_->PutCount(), puts_at_stop);
+}
+
+TEST_F(FileNumberGuardTest, SstUploadWithoutPublisherPassesThrough) {
+  const std::string local_path = tmp_dir_ + "/000123.sst-epoch1";
+  const std::string object_path = "dbpath/000123.sst-epoch1";
+  CloudStorageWritableFileImpl file(cfs_.get(), local_path, "guard-bucket",
+                                    object_path, FileOptions());
+  ASSERT_OK(file.status());
+  ASSERT_OK(file.Append(Slice("sst contents"), IOOptions(), nullptr));
+
+  ASSERT_OK(file.Close(IOOptions(), nullptr));
+  ASSERT_TRUE(provider_->HasObject(object_path));
+}
+
+TEST_F(FileNumberGuardTest, StoppedPublisherRejectsSstUpload) {
+  LoadManifestWithEpoch("epoch1");
+  auto pub = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+  ASSERT_OK(pub->OnJobBegin(123, 1, 1));
+  cfs_->SetFileNumberGuardPublisher(pub);
+  pub->Stop();
+
+  const std::string local_path = tmp_dir_ + "/000123.sst-epoch1";
+  const std::string object_path = "dbpath/000123.sst-epoch1";
+  CloudStorageWritableFileImpl file(cfs_.get(), local_path, "guard-bucket",
+                                    object_path, FileOptions());
+  ASSERT_OK(file.status());
+  ASSERT_OK(file.Append(Slice("sst contents"), IOOptions(), nullptr));
+
+  ASSERT_NOK(file.Close(IOOptions(), nullptr));
+  ASSERT_FALSE(provider_->HasObject(object_path));
 }
 
 }  //  namespace ROCKSDB_NAMESPACE

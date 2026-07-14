@@ -209,65 +209,79 @@ Status FileNumberGuardPublisher::PutValue(uint64_t value,
 
 Status FileNumberGuardPublisher::OnJobBegin(uint64_t file_number,
                                             uint64_t thread_id, int job_id) {
-  bool below_watermark;
+  std::lock_guard<std::mutex> lk(state_mutex_);
+  window_.Add(file_number, thread_id, job_id);
+  return Status::OK();
+}
+
+Status FileNumberGuardPublisher::ProtectFileUpload(uint64_t file_number) {
+  {
+    std::lock_guard<std::mutex> lk(stop_mutex_);
+    if (stopped_) {
+      return Status::ShutdownInProgress("file number guard stopped");
+    }
+  }
+
+  std::lock_guard<std::mutex> publish_lk(publish_mutex_);
+  {
+    std::lock_guard<std::mutex> lk(stop_mutex_);
+    if (stopped_) {
+      return Status::ShutdownInProgress("file number guard stopped");
+    }
+  }
+
+  uint64_t desired;
   {
     std::lock_guard<std::mutex> lk(state_mutex_);
-    window_.Add(file_number, thread_id, job_id);
-    below_watermark = file_number < last_published_;
-  }
-  if (!below_watermark) {
-    return Status::OK();
+    desired = window_.SmallestFileNumber();
+    if (desired == std::numeric_limits<uint64_t>::max()) {
+      return Status::InvalidArgument("no live file number registration");
+    }
+    if (desired > file_number) {
+      return Status::InvalidArgument(
+          "live file number minimum exceeds SST file number");
+    }
+    if (desired >= last_published_) {
+      return Status::OK();
+    }
   }
 
   std::string epoch = CurrentEpoch();
   if (epoch.empty()) {
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
-        "[fng] Cannot publish downward for job %d: epoch unavailable",
-        job_id);
+        "[fng] Cannot protect SST %llu: epoch unavailable",
+        static_cast<unsigned long long>(file_number));
     return Status::InvalidArgument("empty epoch for file number guard");
   }
 
-  // Downward publish. This closes the race where the published value is
-  // UINT64_MAX (idle) and a new job starts: the guard must reach S3 before
-  // the job proceeds to upload anything.
-  std::lock_guard<std::mutex> publish_lk(publish_mutex_);
-  {
-    // Re-check: a concurrent downward publish may have already lowered the
-    // watermark below our value while we waited for the publish mutex.
-    std::lock_guard<std::mutex> lk(state_mutex_);
-    if (file_number >= last_published_) {
-      return Status::OK();
-    }
-  }
-
-  // Retry with backoff until the PUT succeeds or the publisher is stopped.
-  // last_published_ must not advance past a failed downward PUT: if the one
-  // PUT that lowers the value fails and we advanced anyway, the downward
-  // path would never re-fire and the purger could delete an in-flight
-  // upload.
   Status st;
   auto backoff = std::chrono::milliseconds(100);
   const auto max_backoff = std::chrono::milliseconds(2000);
   while (true) {
-    st = PutValue(file_number, epoch);
+    {
+      std::lock_guard<std::mutex> lk(stop_mutex_);
+      if (stopped_) {
+        return Status::ShutdownInProgress("file number guard stopped");
+      }
+    }
+    st = PutValue(desired, epoch);
     if (st.ok()) {
       std::lock_guard<std::mutex> lk(state_mutex_);
-      if (file_number < last_published_) {
-        last_published_ = file_number;
+      if (desired < last_published_) {
+        last_published_ = desired;
       }
       sentinel_dirty_ = false;
       return Status::OK();
     }
     Log(InfoLogLevel::WARN_LEVEL, cfs_->info_log_,
-        "[fng] Downward publish of %llu failed (%s); retrying in %lld ms "
-        "while blocking job %d",
+        "[fng] Downward publish of %llu for SST %llu failed (%s); retrying "
+        "in %lld ms",
+        static_cast<unsigned long long>(desired),
         static_cast<unsigned long long>(file_number), st.ToString().c_str(),
-        static_cast<long long>(backoff.count()), job_id);
+        static_cast<long long>(backoff.count()));
     std::unique_lock<std::mutex> lk(stop_mutex_);
     if (stop_cv_.wait_for(lk, backoff, [this] { return stopped_; })) {
-      // Shutting down. The job proceeds, but the DB is closing; report the
-      // failure to the caller.
-      return st;
+      return Status::ShutdownInProgress("file number guard stopped");
     }
     backoff = std::min(backoff * 2, max_backoff);
   }
@@ -360,24 +374,33 @@ uint64_t FileNumberGuardPublisher::TEST_LastPublished() {
 
 // ---------------- FileNumberGuardListener ----------------
 
-void FileNumberGuardListener::JobBegin(DB *db, uint64_t thread_id,
+void FileNumberGuardListener::JobBegin(uint64_t file_number, uint64_t thread_id,
                                        int job_id) {
-  if (db == nullptr || !publisher_) {
+  if (!publisher_) {
     return;
   }
-  // Output file numbers are allocated after this callback fires, so every
-  // in-flight output number of this job is > this snapshot.
-  uint64_t snapshot = db->GetNextFileNumber() - 1;
-  Status s = publisher_->OnJobBegin(snapshot, thread_id, job_id);
+  Status s = publisher_->OnJobBegin(file_number, thread_id, job_id);
   s.PermitUncheckedError();
 }
 
 void FileNumberGuardListener::OnFlushBegin(DB *db, const FlushJobInfo &info) {
-  JobBegin(db, info.thread_id, info.job_id);
+  if (!publisher_) {
+    return;
+  }
+  uint64_t file_number = info.file_number;
+  if (file_number == 0) {
+    if (db == nullptr) {
+      return;
+    }
+    // Atomic flush notifies before allocating its output numbers, so every
+    // output from that job is greater than this conservative snapshot.
+    file_number = db->GetNextFileNumber() - 1;
+  }
+  JobBegin(file_number, info.thread_id, info.job_id);
 }
 
-void FileNumberGuardListener::OnFlushCompleted(DB * /*db*/,
-                                               const FlushJobInfo &info) {
+void FileNumberGuardListener::OnFlushFinished(DB * /*db*/,
+                                              const FlushJobEndInfo &info) {
   if (publisher_) {
     publisher_->OnJobEnd(info.thread_id, info.job_id);
   }
@@ -385,7 +408,10 @@ void FileNumberGuardListener::OnFlushCompleted(DB * /*db*/,
 
 void FileNumberGuardListener::OnCompactionBegin(DB *db,
                                                 const CompactionJobInfo &info) {
-  JobBegin(db, info.thread_id, info.job_id);
+  if (db != nullptr) {
+    // Compaction output numbers are allocated after this callback.
+    JobBegin(db->GetNextFileNumber() - 1, info.thread_id, info.job_id);
+  }
 }
 
 void FileNumberGuardListener::OnCompactionCompleted(

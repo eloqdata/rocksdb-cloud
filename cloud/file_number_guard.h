@@ -106,10 +106,14 @@ class FileNumberSlidingWindow {
 //  - publish_mutex_ serializes every S3 PUT. Two concurrent PUTs could land
 //    out of order and reinstate a dangerously high threshold; the publish
 //    mutex plus the post-acquire staleness re-check make that impossible.
-//  - A downward publish (a job beginning below the published watermark) PUTs
-//    synchronously and retries with backoff until it succeeds or Stop() is
-//    called; the triggering job is blocked rather than allowed to proceed
-//    unprotected. last_published_ only advances after a successful PUT.
+//  - ProtectFileUpload serializes a required downward PUT and retries with
+//    backoff until it succeeds or Stop() is called. The SST upload is blocked
+//    rather than allowed to proceed unprotected. last_published_ only advances
+//    after a successful PUT.
+//
+// cfs_ is non-owning. CloudFileSystemImpl owns an installed publisher and
+// synchronously stops it before destroying the manifest and storage-provider
+// members reached by publisher callbacks.
 class FileNumberGuardPublisher {
  public:
   FileNumberGuardPublisher(CloudFileSystemImpl *cfs,
@@ -128,15 +132,17 @@ class FileNumberGuardPublisher {
   // loop. Idempotent; called from the destructor.
   void Stop();
 
-  // A flush/compaction job observed `file_number` as the largest allocated
-  // number when it began. Registers the job in the window and, if the value
-  // is below the published watermark, synchronously publishes it downward
-  // BEFORE returning (blocking the job's thread until the PUT succeeds or
-  // the publisher is stopped).
+  // Registers a flush/compaction job in the live window. This bookkeeping-only
+  // listener path performs no remote I/O.
   Status OnJobBegin(uint64_t file_number, uint64_t thread_id, int job_id);
 
   // The job completed; its entry starts lingering.
   void OnJobEnd(uint64_t thread_id, int job_id);
+
+  // Ensures the current live-window minimum is published at or below the SST
+  // file number before upload. A required downward PUT retries until it
+  // succeeds or Stop() interrupts it.
+  Status ProtectFileUpload(uint64_t file_number);
 
   // Publishes the 0 sentinel ("purging blocked") for the current epoch.
   // Does not advance last_published_, so the next real value (including a
@@ -192,12 +198,12 @@ class FileNumberGuardListener : public EventListener {
   const char *Name() const override { return "FileNumberGuardListener"; }
 
   void OnFlushBegin(DB *db, const FlushJobInfo &info) override;
-  void OnFlushCompleted(DB *db, const FlushJobInfo &info) override;
+  void OnFlushFinished(DB *db, const FlushJobEndInfo &info) override;
   void OnCompactionBegin(DB *db, const CompactionJobInfo &info) override;
   void OnCompactionCompleted(DB *db, const CompactionJobInfo &info) override;
 
  private:
-  void JobBegin(DB *db, uint64_t thread_id, int job_id);
+  void JobBegin(uint64_t file_number, uint64_t thread_id, int job_id);
 
   std::shared_ptr<FileNumberGuardPublisher> publisher_;
 };
