@@ -52,6 +52,14 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace {
+
+bool HasReachedAge(uint64_t now, uint64_t mtime, uint64_t threshold) {
+  return now > mtime && now - mtime >= threshold;
+}
+
+}  // namespace
+
 S3FileNumberReader::S3FileNumberReader(const std::string &bucket_name,
                                        const std::string &s3_object_path,
                                        const std::string &epoch,
@@ -246,7 +254,9 @@ bool EloqPurger::RunSinglePurgeCycle() {
     return false;
   }
 
-  // Enhanced selection with file number checking
+  // The cap consumes a deterministic SST -> MANIFEST -> CLOUDMANIFEST ->
+  // marker prefix. Metadata can wait behind an SST backlog, but the remainder
+  // is re-selected and converges on later cycles.
   SelectObsoleteSSTFilesWithThreshold(state.all_files, state.live_file_names,
                                       state.file_number_thresholds,
                                       state.s3_current_time,
@@ -269,6 +279,7 @@ bool EloqPurger::RunSinglePurgeCycle() {
                                   state.s3_current_time,
                                   &state.obsolete_files);
 
+  Status deletion_status;
   if (dry_run_) {
     Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
         "[pg] DRY RUN: Would delete %zu files", state.obsolete_files.size());
@@ -277,7 +288,7 @@ bool EloqPurger::RunSinglePurgeCycle() {
           "[pg] DRY RUN: Would delete %s", file.c_str());
     }
   } else {
-    DeleteObsoleteFiles(state.obsolete_files);
+    deletion_status = DeleteObsoleteFiles(state.obsolete_files);
   }
 
   Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
@@ -287,7 +298,7 @@ bool EloqPurger::RunSinglePurgeCycle() {
       state.live_file_names.size(), state.obsolete_files.size(),
       state.file_number_thresholds.size());
 
-  return true;
+  return deletion_status.ok();
 }
 
 Status EloqPurger::ListAllFiles(PurgerAllFiles *all_files) {
@@ -471,6 +482,7 @@ void EloqPurger::SelectObsoleteSSTFilesWithThreshold(
     auto threshold_it = thresholds.find(candidate_epoch);
     if (threshold_it != thresholds.end()) {
       uint64_t threshold = threshold_it->second;
+      // Zero is the intentional full-block sentinel for a live epoch.
       if (threshold != std::numeric_limits<uint64_t>::min()) {
         // Extract file number from candidate file name
         uint64_t file_number = 0;
@@ -503,8 +515,7 @@ void EloqPurger::SelectObsoleteSSTFilesWithThreshold(
       // mid-branch-creation) whose SSTs were uploaded before our listing
       // but whose CLOUDMANIFEST landed after it.
       uint64_t file_mtime = candidate.second.modification_time;
-      if (s3_current_time > file_mtime &&
-          s3_current_time - file_mtime >= dead_epoch_file_age_ms_) {
+      if (HasReachedAge(s3_current_time, file_mtime, dead_epoch_file_age_ms_)) {
         obsolete_files->push_back(candidate_file_path);
         Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
             "[pg] File %s selected for deletion (dead epoch %s, "
@@ -551,8 +562,8 @@ void EloqPurger::SelectObsoleteManifestFiles(
     // CLOUDMANIFEST. The age guard keeps such a fresh MANIFEST until the
     // open either commits (epoch becomes current) or is abandoned.
     uint64_t manifest_mtime = candidate.second.modification_time;
-    if (s3_current_time > manifest_mtime &&
-        s3_current_time - manifest_mtime >= dead_epoch_file_age_ms_) {
+    if (HasReachedAge(s3_current_time, manifest_mtime,
+                      dead_epoch_file_age_ms_)) {
       obsolete_files->push_back(candidate_file_path);
       Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
           "[pg] Manifest file %s selected for deletion (dead epoch %s, "
@@ -625,22 +636,18 @@ Status EloqPurger::GetS3CurrentTime(uint64_t *current_time) {
     return Status::IOError(s.ToString());
   }
 
-  // Get the metadata to read the timestamp
-  CloudObjectInformation file_info;
-  s = cfs_->GetStorageProvider()->GetCloudObjectMetadata(
-      bucket_name_, temp_s3_path, &file_info);
+  s = cfs_->GetStorageProvider()->GetCloudObjectModificationTime(
+      bucket_name_, temp_s3_path, current_time);
 
   if (!s.ok()) {
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
-        "[pg] Failed to get metadata for temp file from S3: %s",
+        "[pg] Failed to get modification time for temp file from S3: %s",
         s.ToString().c_str());
     // Try to delete the temp file anyway
     cfs_->GetStorageProvider()->DeleteCloudObject(bucket_name_, temp_s3_path);
     std::remove(temp_local_path.c_str());
     return Status::IOError(s.ToString());
   }
-
-  *current_time = file_info.modification_time;
 
   // Delete the temporary file from S3
   s = cfs_->GetStorageProvider()->DeleteCloudObject(bucket_name_, temp_s3_path);
@@ -674,7 +681,6 @@ void EloqPurger::SelectObsoleteCloudManifestFiles(
   struct CloudManifestFileInfo {
     uint64_t term;
     std::string file_path;
-    uint64_t current_manifest_timestamp;
     // The CLOUDMANIFEST object's own S3 mtime. A CLOUDMANIFEST is written
     // once, when its generation starts, so the max-term entry's mtime is
     // the moment the older terms in the group were superseded.
@@ -682,11 +688,9 @@ void EloqPurger::SelectObsoleteCloudManifestFiles(
     std::string epoch;
 
     CloudManifestFileInfo(uint64_t t, const std::string &path,
-                          uint64_t manifest_ts, uint64_t cloudmanifest_ts,
-                          const std::string &ep)
+                          uint64_t cloudmanifest_ts, const std::string &ep)
         : term(t),
           file_path(path),
-          current_manifest_timestamp(manifest_ts),
           cloudmanifest_timestamp(cloudmanifest_ts),
           epoch(ep) {}
   };
@@ -717,7 +721,8 @@ void EloqPurger::SelectObsoleteCloudManifestFiles(
 
     std::string current_epoch = manifest_it->second->GetCurrentEpoch();
 
-    // Look up the current manifest file timestamp for this epoch
+    // Preserve the current-epoch manifest lookup: missing info means this
+    // CLOUDMANIFEST is not safe to consider for deletion this cycle.
     auto manifest_info_it = current_epoch_manifest_infos.find(current_epoch);
     if (manifest_info_it == current_epoch_manifest_infos.end()) {
       Log(InfoLogLevel::WARN_LEVEL, cfs_->info_log_,
@@ -726,9 +731,6 @@ void EloqPurger::SelectObsoleteCloudManifestFiles(
           current_epoch.c_str(), candidate_file_path.c_str());
       continue;
     }
-
-    uint64_t current_manifest_timestamp =
-        manifest_info_it->second.modification_time;
 
     // Extract the part after "CLOUDMANIFEST-"
     std::string remainder = candidate_file_path.substr(prefix.length());
@@ -762,16 +764,15 @@ void EloqPurger::SelectObsoleteCloudManifestFiles(
     }
 
     // Group by postfix
-    grouped_manifests[postfix].emplace_back(
-        term, candidate_file_path, current_manifest_timestamp,
-        candidate.second.modification_time, current_epoch);
+    grouped_manifests[postfix].emplace_back(term, candidate_file_path,
+                                            candidate.second.modification_time,
+                                            current_epoch);
 
     Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
         "[pg] Found CLOUDMANIFEST file %s with postfix='%s', term=%llu, "
-        "manifest_timestamp=%llu, cloudmanifest_timestamp=%llu, epoch=%s",
+        "cloudmanifest_timestamp=%llu, epoch=%s",
         candidate_file_path.c_str(), postfix.c_str(),
         static_cast<unsigned long long>(term),
-        static_cast<unsigned long long>(current_manifest_timestamp),
         static_cast<unsigned long long>(candidate.second.modification_time),
         current_epoch.c_str());
   }
@@ -827,35 +828,30 @@ void EloqPurger::SelectObsoleteCloudManifestFiles(
       // for the full retention window, giving the superseded generation a
       // guaranteed grace period regardless of how long it had been
       // write-idle before the failover.
-      if (current_time > supersession_time &&
-          (current_time - supersession_time) >= retention_threshold_ms) {
+      if (HasReachedAge(current_time, supersession_time,
+                        retention_threshold_ms)) {
         obsolete_files->push_back(file_info.file_path);
         Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
             "[pg] CLOUDMANIFEST file %s selected for deletion "
-            "(term=%llu, manifest_timestamp=%llu, supersession_time=%llu, "
-            "s3_current_time=%llu, epoch=%s, superseded_for=%llu ms)",
+            "(term=%llu, supersession_time=%llu, s3_current_time=%llu, "
+            "epoch=%s, superseded_for=%llu ms)",
             file_info.file_path.c_str(),
             static_cast<unsigned long long>(file_info.term),
-            static_cast<unsigned long long>(
-                file_info.current_manifest_timestamp),
             static_cast<unsigned long long>(supersession_time),
             static_cast<unsigned long long>(current_time),
             file_info.epoch.c_str(),
-            static_cast<unsigned long long>(current_time -
-                                            supersession_time));
+            static_cast<unsigned long long>(current_time - supersession_time));
       } else {
         uint64_t time_diff = (current_time > supersession_time)
                                  ? (current_time - supersession_time)
                                  : 0;
         Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
             "[pg] Keeping CLOUDMANIFEST file %s "
-            "(term=%llu, manifest_timestamp=%llu, supersession_time=%llu, "
-            "s3_current_time=%llu, epoch=%s, superseded_for=%llu ms < "
-            "retention threshold %llu ms)",
+            "(term=%llu, supersession_time=%llu, s3_current_time=%llu, "
+            "epoch=%s, superseded_for=%llu ms < retention threshold %llu "
+            "ms)",
             file_info.file_path.c_str(),
             static_cast<unsigned long long>(file_info.term),
-            static_cast<unsigned long long>(
-                file_info.current_manifest_timestamp),
             static_cast<unsigned long long>(supersession_time),
             static_cast<unsigned long long>(current_time),
             file_info.epoch.c_str(), static_cast<unsigned long long>(time_diff),
@@ -889,8 +885,7 @@ void EloqPurger::SelectObsoleteFileNumberMarkers(
     }
 
     uint64_t marker_mtime = candidate.second.modification_time;
-    if (s3_current_time > marker_mtime &&
-        s3_current_time - marker_mtime >= dead_epoch_file_age_ms_) {
+    if (HasReachedAge(s3_current_time, marker_mtime, dead_epoch_file_age_ms_)) {
       obsolete_files->push_back(candidate_file_path);
       Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
           "[pg] File number marker %s selected for deletion (dead epoch %s)",
@@ -905,7 +900,7 @@ void EloqPurger::SelectObsoleteFileNumberMarkers(
   }
 }
 
-void EloqPurger::DeleteObsoleteFiles(
+Status EloqPurger::DeleteObsoleteFiles(
     const std::vector<std::string> &obsolete_files) {
   size_t deleted = 0;
   size_t failures = 0;
@@ -932,13 +927,18 @@ void EloqPurger::DeleteObsoleteFiles(
       bucket_name_, paths_to_delete, &deleted, &failures);
   if (!s.ok()) {
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
-        "[pg] Failed to delete some obsolete files: %s", s.ToString().c_str());
+        "[pg] Obsolete deletion failed: selected=%zu requested=%zu "
+        "deleted=%zu failures=%zu: %s",
+        obsolete_files.size(), to_delete, deleted, failures,
+        s.ToString().c_str());
+    return s;
   }
 
   Log(InfoLogLevel::DEBUG_LEVEL, cfs_->info_log_,
       "[pg] Obsolete deletion summary: selected=%zu requested=%zu "
       "deleted=%zu failures=%zu",
       obsolete_files.size(), to_delete, deleted, failures);
+  return Status::OK();
 }
 
 // ------------- Main purger thread ------------- //

@@ -22,14 +22,19 @@
 
 #include "cloud/eloq_purger.h"
 
+#include <algorithm>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "cloud/cloud_manifest.h"
 #include "rocksdb/cloud/cloud_file_system.h"
+#include "rocksdb/cloud/cloud_storage_provider.h"
 #include "test_util/testharness.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -46,6 +51,155 @@ CloudObjectInformation MakeInfo(uint64_t mtime) {
   info.size = 0;
   info.modification_time = mtime;
   return info;
+}
+
+class RecordingPurgerStorageProvider : public CloudStorageProvider {
+ public:
+  using PurgerAllFiles = EloqPurger::PurgerAllFiles;
+
+  explicit RecordingPurgerStorageProvider(PurgerAllFiles files)
+      : files_(std::move(files)) {}
+
+  const char *Name() const override { return "recording-purger"; }
+
+  void SetDeleteStatus(const std::string &path, IOStatus status) {
+    delete_statuses_[path] = std::move(status);
+  }
+
+  const std::vector<std::string> &delete_attempts() const {
+    return delete_attempts_;
+  }
+
+  IOStatus DeleteCloudObject(const std::string & /*bucket_name*/,
+                             const std::string &object_path) override {
+    if (clock_objects_.erase(object_path) != 0) {
+      return IOStatus::OK();
+    }
+
+    delete_attempts_.push_back(object_path);
+    auto status_it = delete_statuses_.find(object_path);
+    IOStatus status = status_it == delete_statuses_.end() ? IOStatus::OK()
+                                                          : status_it->second;
+    if (status.ok() || status.IsNotFound()) {
+      const std::string prefix = object_path_ + "/";
+      const std::string relative_path =
+          object_path.compare(0, prefix.size(), prefix) == 0
+              ? object_path.substr(prefix.size())
+              : object_path;
+      files_.erase(std::remove_if(files_.begin(), files_.end(),
+                                  [&](const auto &file) {
+                                    return file.first == relative_path;
+                                  }),
+                   files_.end());
+    }
+    return status;
+  }
+
+  IOStatus ListCloudObjects(const std::string & /*bucket_name*/,
+                            const std::string &object_path,
+                            PurgerAllFiles *files) override {
+    object_path_ = object_path;
+    *files = files_;
+    return IOStatus::OK();
+  }
+
+  IOStatus ListCloudObjectsWithPrefix(
+      const std::string & /*bucket_name*/, const std::string & /*object_path*/,
+      const std::string &object_prefix,
+      std::vector<std::string> *paths) override {
+    for (const auto &file : files_) {
+      if (file.first.compare(0, object_prefix.size(), object_prefix) == 0) {
+        paths->push_back(file.first);
+      }
+    }
+    return IOStatus::OK();
+  }
+
+  IOStatus PutCloudObject(const std::string & /*local_path*/,
+                          const std::string & /*bucket_name*/,
+                          const std::string &object_path) override {
+    clock_objects_.insert(object_path);
+    return IOStatus::OK();
+  }
+
+  IOStatus GetCloudObjectModificationTime(const std::string & /*bucket_name*/,
+                                          const std::string &object_path,
+                                          uint64_t *time) override {
+    if (clock_objects_.find(object_path) == clock_objects_.end()) {
+      return IOStatus::NotFound();
+    }
+    *time = kNow;
+    return IOStatus::OK();
+  }
+
+  IOStatus CreateBucket(const std::string &) override { return NotSupported(); }
+  IOStatus ExistsBucket(const std::string &) override { return NotSupported(); }
+  IOStatus EmptyBucket(const std::string &, const std::string &) override {
+    return NotSupported();
+  }
+  IOStatus ListCloudObjects(const std::string &, const std::string &,
+                            std::vector<std::string> *) override {
+    return NotSupported();
+  }
+  IOStatus ExistsCloudObject(const std::string &,
+                             const std::string &) override {
+    return NotSupported();
+  }
+  IOStatus GetCloudObjectSize(const std::string &, const std::string &,
+                              uint64_t *) override {
+    return NotSupported();
+  }
+  IOStatus GetCloudObjectMetadata(const std::string &, const std::string &,
+                                  CloudObjectInformation *) override {
+    return NotSupported();
+  }
+  IOStatus CopyCloudObject(const std::string &, const std::string &,
+                           const std::string &, const std::string &) override {
+    return NotSupported();
+  }
+  IOStatus GetCloudObject(const std::string &, const std::string &,
+                          const std::string &) override {
+    return NotSupported();
+  }
+  IOStatus PutCloudObjectMetadata(
+      const std::string &, const std::string &,
+      const std::unordered_map<std::string, std::string> &) override {
+    return NotSupported();
+  }
+  IOStatus NewCloudWritableFile(const std::string &, const std::string &,
+                                const std::string &, const FileOptions &,
+                                std::unique_ptr<CloudStorageWritableFile> *,
+                                IODebugContext *) override {
+    return NotSupported();
+  }
+  IOStatus NewCloudReadableFile(const std::string &, const std::string &,
+                                const FileOptions &,
+                                std::unique_ptr<CloudStorageReadableFile> *,
+                                IODebugContext *) override {
+    return NotSupported();
+  }
+
+ private:
+  static IOStatus NotSupported() {
+    return IOStatus::NotSupported("RecordingPurgerStorageProvider");
+  }
+
+  PurgerAllFiles files_;
+  std::string object_path_;
+  std::unordered_map<std::string, IOStatus> delete_statuses_;
+  std::unordered_set<std::string> clock_objects_;
+  std::vector<std::string> delete_attempts_;
+};
+
+std::unique_ptr<CloudFileSystemImpl> MakeCloudFileSystem(
+    const std::shared_ptr<CloudStorageProvider> &provider) {
+  CloudFileSystemOptions opts;
+  opts.storage_provider = provider;
+  opts.dest_bucket.SetBucketName("test-bucket");
+  opts.dest_bucket.SetObjectPath("dbpath");
+  opts.cloud_file_deletion_delay = std::nullopt;
+  return std::make_unique<CloudFileSystemImpl>(opts, FileSystem::Default(),
+                                               nullptr /*logger*/);
 }
 
 }  // namespace
@@ -224,6 +378,103 @@ TEST_F(EloqPurgerTest, DeadEpochMarkersReclaimed) {
                                           &obsolete);
   ASSERT_EQ(obsolete,
             std::vector<std::string>{"smallest_new_file_number-epochDead"});
+}
+
+TEST_F(EloqPurgerTest, FutureTimestampsAreRetainedByEveryAgeGuard) {
+  EloqPurger::PurgerCloudManifestMap cloudmanifests;
+  std::unique_ptr<CloudManifest> old_cm;
+  std::unique_ptr<CloudManifest> new_cm;
+  ASSERT_OK(CloudManifest::CreateForEmptyDatabase("epochOld", &old_cm));
+  ASSERT_OK(CloudManifest::CreateForEmptyDatabase("epochNew", &new_cm));
+  cloudmanifests["CLOUDMANIFEST-db-1"] = std::move(old_cm);
+  cloudmanifests["CLOUDMANIFEST-db-2"] = std::move(new_cm);
+
+  EloqPurger::PurgerAllFiles all_files{
+      {"000001.sst-epochDead", MakeInfo(kNow + 1)},
+      {"MANIFEST-epochDead", MakeInfo(kNow + 1)},
+      {"CLOUDMANIFEST-db-1", MakeInfo(kNow - 2 * kHourMs)},
+      {"CLOUDMANIFEST-db-2", MakeInfo(kNow + 1)},
+      {"smallest_new_file_number-epochDead", MakeInfo(kNow + 1)},
+  };
+  EloqPurger::PurgerEpochManifestMap current_epochs{
+      {"epochOld", MakeInfo(kNow)}, {"epochNew", MakeInfo(kNow)}};
+
+  std::vector<std::string> obsolete;
+  purger_.SelectObsoleteSSTFilesWithThreshold(all_files, {}, {}, kNow,
+                                              &obsolete);
+  purger_.SelectObsoleteManifestFiles(all_files, current_epochs, kNow,
+                                      &obsolete);
+  purger_.SelectObsoleteCloudManifestFiles(all_files, cloudmanifests,
+                                           current_epochs, kNow, &obsolete);
+  purger_.SelectObsoleteFileNumberMarkers(all_files, {}, kNow, &obsolete);
+  ASSERT_TRUE(obsolete.empty());
+}
+
+TEST_F(EloqPurgerTest, ZeroThresholdBlocksLivingEpochSstDeletion) {
+  EloqPurger::PurgerAllFiles all_files{
+      {"000001.sst-epochA", MakeInfo(kNow - 10 * kHourMs)},
+      {"000002.sst-epochA", MakeInfo(kNow - 10 * kHourMs)},
+  };
+
+  std::vector<std::string> obsolete;
+  purger_.SelectObsoleteSSTFilesWithThreshold(all_files, {}, {{"epochA", 0}},
+                                              kNow, &obsolete);
+  ASSERT_TRUE(obsolete.empty());
+}
+
+TEST(EloqPurgerCycleTest, NotFoundDeletionCountsAsSuccess) {
+  const std::string file = "000001.sst-epochDead";
+  auto provider = std::make_shared<RecordingPurgerStorageProvider>(
+      EloqPurger::PurgerAllFiles{{file, MakeInfo(kNow - 2 * kHourMs)}});
+  provider->SetDeleteStatus("dbpath/" + file,
+                            IOStatus::NotFound("already deleted"));
+  auto cfs = MakeCloudFileSystem(provider);
+  EloqPurger purger(cfs.get(), "test-bucket", "dbpath", false /*dry_run*/,
+                    kHourMs, kHourMs, 10000);
+
+  ASSERT_TRUE(purger.RunSinglePurgeCycle());
+  ASSERT_EQ(provider->delete_attempts(),
+            std::vector<std::string>{"dbpath/" + file});
+}
+
+TEST(EloqPurgerCycleTest, DeletionCapConsumesDeterministicPrefixThenConverges) {
+  auto provider = std::make_shared<RecordingPurgerStorageProvider>(
+      EloqPurger::PurgerAllFiles{
+          {"000001.sst-epochDead", MakeInfo(kNow - 2 * kHourMs)},
+          {"000002.sst-epochDead", MakeInfo(kNow - 2 * kHourMs)},
+          {"MANIFEST-epochDead", MakeInfo(kNow - 2 * kHourMs)},
+          {"smallest_new_file_number-epochDead", MakeInfo(kNow - 2 * kHourMs)},
+      });
+  auto cfs = MakeCloudFileSystem(provider);
+  EloqPurger purger(cfs.get(), "test-bucket", "dbpath", false /*dry_run*/,
+                    kHourMs, kHourMs, 2 /*max_deletions_per_cycle*/);
+
+  ASSERT_TRUE(purger.RunSinglePurgeCycle());
+  ASSERT_EQ(provider->delete_attempts(),
+            std::vector<std::string>({"dbpath/000001.sst-epochDead",
+                                      "dbpath/000002.sst-epochDead"}));
+
+  ASSERT_TRUE(purger.RunSinglePurgeCycle());
+  ASSERT_EQ(provider->delete_attempts(),
+            std::vector<std::string>(
+                {"dbpath/000001.sst-epochDead", "dbpath/000002.sst-epochDead",
+                 "dbpath/MANIFEST-epochDead",
+                 "dbpath/smallest_new_file_number-epochDead"}));
+}
+
+TEST(EloqPurgerCycleTest, BulkDeleteFailureFailsCycle) {
+  const std::string file = "000001.sst-epochDead";
+  auto provider = std::make_shared<RecordingPurgerStorageProvider>(
+      EloqPurger::PurgerAllFiles{{file, MakeInfo(kNow - 2 * kHourMs)}});
+  provider->SetDeleteStatus("dbpath/" + file,
+                            IOStatus::IOError("injected delete failure"));
+  auto cfs = MakeCloudFileSystem(provider);
+  EloqPurger purger(cfs.get(), "test-bucket", "dbpath", false /*dry_run*/,
+                    kHourMs, kHourMs, 10000);
+
+  ASSERT_FALSE(purger.RunSinglePurgeCycle());
+  ASSERT_EQ(provider->delete_attempts(),
+            std::vector<std::string>{"dbpath/" + file});
 }
 
 }  //  namespace ROCKSDB_NAMESPACE

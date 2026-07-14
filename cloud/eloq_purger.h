@@ -153,7 +153,7 @@ class EloqPurger {
   Status LoadFileNumberThresholds(const PurgerCloudManifestMap &cloudmanifests,
                                   PurgerFileNumberThresholds *thresholds);
   Status GetS3CurrentTime(uint64_t *current_time);
-  void DeleteObsoleteFiles(const std::vector<std::string> &obsolete_files);
+  Status DeleteObsoleteFiles(const std::vector<std::string> &obsolete_files);
 };
 
 }  // namespace ROCKSDB_NAMESPACE
