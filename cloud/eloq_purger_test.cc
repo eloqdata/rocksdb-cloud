@@ -123,12 +123,18 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
   }
 
   IOStatus GetCloudObjectModificationTime(const std::string & /*bucket_name*/,
-                                          const std::string &object_path,
-                                          uint64_t *time) override {
+                                          const std::string & /*object_path*/,
+                                          uint64_t * /*time*/) override {
+    return NotSupported();
+  }
+
+  IOStatus GetCloudObjectMetadata(const std::string & /*bucket_name*/,
+                                  const std::string &object_path,
+                                  CloudObjectInformation *info) override {
     if (clock_objects_.find(object_path) == clock_objects_.end()) {
       return IOStatus::NotFound();
     }
-    *time = kNow;
+    *info = MakeInfo(kNow);
     return IOStatus::OK();
   }
 
@@ -147,10 +153,6 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
   }
   IOStatus GetCloudObjectSize(const std::string &, const std::string &,
                               uint64_t *) override {
-    return NotSupported();
-  }
-  IOStatus GetCloudObjectMetadata(const std::string &, const std::string &,
-                                  CloudObjectInformation *) override {
     return NotSupported();
   }
   IOStatus CopyCloudObject(const std::string &, const std::string &,
@@ -440,10 +442,10 @@ TEST(EloqPurgerCycleTest, NotFoundDeletionCountsAsSuccess) {
 TEST(EloqPurgerCycleTest, DeletionCapConsumesDeterministicPrefixThenConverges) {
   auto provider = std::make_shared<RecordingPurgerStorageProvider>(
       EloqPurger::PurgerAllFiles{
-          {"000001.sst-epochDead", MakeInfo(kNow - 2 * kHourMs)},
-          {"000002.sst-epochDead", MakeInfo(kNow - 2 * kHourMs)},
-          {"MANIFEST-epochDead", MakeInfo(kNow - 2 * kHourMs)},
           {"smallest_new_file_number-epochDead", MakeInfo(kNow - 2 * kHourMs)},
+          {"000001.sst-epochDead", MakeInfo(kNow - 2 * kHourMs)},
+          {"MANIFEST-epochDead", MakeInfo(kNow - 2 * kHourMs)},
+          {"000002.sst-epochDead", MakeInfo(kNow - 2 * kHourMs)},
       });
   auto cfs = MakeCloudFileSystem(provider);
   EloqPurger purger(cfs.get(), "test-bucket", "dbpath", false /*dry_run*/,

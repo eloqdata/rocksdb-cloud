@@ -636,18 +636,21 @@ Status EloqPurger::GetS3CurrentTime(uint64_t *current_time) {
     return Status::IOError(s.ToString());
   }
 
-  s = cfs_->GetStorageProvider()->GetCloudObjectModificationTime(
-      bucket_name_, temp_s3_path, current_time);
+  CloudObjectInformation file_info;
+  s = cfs_->GetStorageProvider()->GetCloudObjectMetadata(
+      bucket_name_, temp_s3_path, &file_info);
 
   if (!s.ok()) {
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
-        "[pg] Failed to get modification time for temp file from S3: %s",
+        "[pg] Failed to get metadata for temp file from S3: %s",
         s.ToString().c_str());
     // Try to delete the temp file anyway
     cfs_->GetStorageProvider()->DeleteCloudObject(bucket_name_, temp_s3_path);
     std::remove(temp_local_path.c_str());
     return Status::IOError(s.ToString());
   }
+
+  *current_time = file_info.modification_time;
 
   // Delete the temporary file from S3
   s = cfs_->GetStorageProvider()->DeleteCloudObject(bucket_name_, temp_s3_path);
