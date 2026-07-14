@@ -37,10 +37,37 @@ class ExternalSSTTestFS : public FileSystemWrapper {
     return target()->LinkFile(s, t, options, dbg);
   }
 
+  IOStatus NewWritableFile(const std::string& f,
+                           const FileOptions& file_opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override {
+    IOStatus status =
+        target()->NewWritableFile(f, file_opts, result, dbg);
+    if (status.ok() && fail_close_) {
+      class CloseFailingWritableFile : public FSWritableFileOwnerWrapper {
+       public:
+        explicit CloseFailingWritableFile(
+            std::unique_ptr<FSWritableFile>&& target)
+            : FSWritableFileOwnerWrapper(std::move(target)) {}
+
+        IOStatus Close(const IOOptions& options,
+                       IODebugContext* dbg) override {
+          IOStatus status = target()->Close(options, dbg);
+          return status.ok() ? IOStatus::IOError("injected close failure")
+                             : status;
+        }
+      };
+      result->reset(new CloseFailingWritableFile(std::move(*result)));
+    }
+    return status;
+  }
+
   void set_fail_link(bool fail_link) { fail_link_ = fail_link; }
+  void set_fail_close(bool fail_close) { fail_close_ = fail_close; }
 
  private:
   bool fail_link_;
+  bool fail_close_ = false;
 };
 
 class ExternalSSTFileTestBase : public DBTestBase {
@@ -2271,13 +2298,47 @@ TEST_P(ExternSSTFileLinkFailFallbackTest, LinkFailFallBackExternalSst) {
   ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
 }
 
+TEST_P(ExternSSTFileLinkFailFallbackTest, CopyCloseFailureIsPropagated) {
+  fs_->set_fail_link(true);
+  DestroyAndReopen(options_);
+
+  const std::string file_path = sst_files_dir_ + "close_error.sst";
+  SstFileWriter writer(EnvOptions(), options_);
+  ASSERT_OK(writer.Open(file_path));
+  ASSERT_OK(writer.Put("key", "value"));
+  ASSERT_OK(writer.Finish());
+
+  fs_->set_fail_close(true);
+  IngestExternalFileOptions ingest_options;
+  ingest_options.move_files = true;
+  ingest_options.failed_move_fall_back_to_copy = true;
+  Status status = db_->IngestExternalFile({file_path}, ingest_options);
+  fs_->set_fail_close(false);
+
+  ASSERT_TRUE(status.IsIOError());
+  ASSERT_NE(status.ToString().find("injected close failure"),
+            std::string::npos);
+}
+
 class TestIngestExternalFileListener : public EventListener {
  public:
+  void OnExternalFileIngestionStarted(DB* /*db*/,
+                                      uint64_t file_number) override {
+    started_file_numbers.push_back(file_number);
+  }
+
+  void OnExternalFileIngestionFinished(DB* /*db*/,
+                                       uint64_t file_number) override {
+    finished_file_numbers.push_back(file_number);
+  }
+
   void OnExternalFileIngested(DB* /*db*/,
                               const ExternalFileIngestionInfo& info) override {
     ingested_files.push_back(info);
   }
 
+  std::vector<uint64_t> started_file_numbers;
+  std::vector<uint64_t> finished_file_numbers;
   std::vector<ExternalFileIngestionInfo> ingested_files;
 };
 
@@ -2580,6 +2641,8 @@ TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamilies_Success) {
       new FaultInjectionTestEnv(env_));
   Options options = CurrentOptions();
   options.env = fault_injection_env.get();
+  auto listener = std::make_shared<TestIngestExternalFileListener>();
+  options.listeners.emplace_back(listener);
   CreateAndReopenWithCF({"pikachu", "eevee"}, options);
 
   // Exercise different situations in different column families: two are empty
@@ -2612,6 +2675,12 @@ TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamilies_Success) {
       column_families.size());
   ASSERT_OK(GenerateAndAddExternalFiles(options, column_families, ifos, data,
                                         -1, true, true_data));
+  ASSERT_EQ(listener->started_file_numbers.size(), 3);
+  ASSERT_EQ(listener->finished_file_numbers, listener->started_file_numbers);
+  for (size_t i = 1; i < listener->started_file_numbers.size(); ++i) {
+    ASSERT_EQ(listener->started_file_numbers[i],
+              listener->started_file_numbers[i - 1] + 1);
+  }
   Close();
   ReopenWithColumnFamilies({kDefaultColumnFamilyName, "pikachu", "eevee"},
                            options);
@@ -2757,6 +2826,8 @@ TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamilies_PrepareFail) {
       new FaultInjectionTestEnv(env_));
   Options options = CurrentOptions();
   options.env = fault_injection_env.get();
+  auto listener = std::make_shared<TestIngestExternalFileListener>();
+  options.listeners.emplace_back(listener);
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   SyncPoint::GetInstance()->LoadDependency({
@@ -2805,6 +2876,9 @@ TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamilies_PrepareFail) {
       "1");
   ingest_thread.join();
 
+  ASSERT_EQ(listener->started_file_numbers.size(), 3);
+  ASSERT_EQ(listener->finished_file_numbers, listener->started_file_numbers);
+
   fault_injection_env->SetFilesystemActive(true);
   Close();
   ReopenWithColumnFamilies({kDefaultColumnFamilyName, "pikachu", "eevee"},
@@ -2827,6 +2901,8 @@ TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamilies_CommitFail) {
       new FaultInjectionTestEnv(env_));
   Options options = CurrentOptions();
   options.env = fault_injection_env.get();
+  auto listener = std::make_shared<TestIngestExternalFileListener>();
+  options.listeners.emplace_back(listener);
   SyncPoint::GetInstance()->DisableProcessing();
   SyncPoint::GetInstance()->ClearAllCallBacks();
   SyncPoint::GetInstance()->LoadDependency({
@@ -2873,6 +2949,9 @@ TEST_P(ExternalSSTFileTest, IngestFilesIntoMultipleColumnFamilies_CommitFail) {
       "ExternalSSTFileTest::IngestFilesIntoMultipleColumnFamilies_CommitFail:"
       "1");
   ingest_thread.join();
+
+  ASSERT_EQ(listener->started_file_numbers.size(), 3);
+  ASSERT_EQ(listener->finished_file_numbers, listener->started_file_numbers);
 
   fault_injection_env->SetFilesystemActive(true);
   Close();

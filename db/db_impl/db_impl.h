@@ -1495,6 +1495,10 @@ class DBImpl : public DB {
 
   void NotifyOnExternalFileIngested(
       ColumnFamilyData* cfd, const ExternalSstFileIngestionJob& ingestion_job);
+  void NotifyOnExternalFileIngestionStarted(uint64_t first_file_number,
+                                            size_t file_count);
+  void NotifyOnExternalFileIngestionFinished(uint64_t first_file_number,
+                                             size_t file_count);
 
   Status FlushAllColumnFamilies(const FlushOptions& flush_options,
                                 FlushReason flush_reason);

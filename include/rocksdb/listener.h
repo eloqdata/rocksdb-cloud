@@ -865,6 +865,16 @@ class EventListener : public Customizable {
   // happens. ShouldBeNotifiedOnFileIO should be set to true to get a callback.
   virtual void OnIOError(const IOErrorInfo& /*info*/) {}
 
+  // Called once for each exact file number reserved for an external file
+  // ingestion or column family import, before file preparation starts.
+  virtual void OnExternalFileIngestionStarted(DB* /*db*/,
+                                              uint64_t /*file_number*/) {}
+
+  // Called once after cleanup for every file number reported to
+  // OnExternalFileIngestionStarted(), whether the operation succeeds or fails.
+  virtual void OnExternalFileIngestionFinished(DB* /*db*/,
+                                               uint64_t /*file_number*/) {}
+
   ~EventListener() override {}
 };
 

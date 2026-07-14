@@ -6348,6 +6348,7 @@ Status DBImpl::IngestExternalFiles(
     ReleaseFileNumberFromPendingOutputs(pending_output_elem);
     return status;
   }
+  NotifyOnExternalFileIngestionStarted(next_file_number, total);
 
   std::vector<ExternalSstFileIngestionJob> ingestion_jobs;
   for (const auto& arg : args) {
@@ -6394,8 +6395,11 @@ Status DBImpl::IngestExternalFiles(
     for (size_t i = 0; i != num_cfs; ++i) {
       ingestion_jobs[i].Cleanup(status);
     }
-    InstrumentedMutexLock l(&mutex_);
-    ReleaseFileNumberFromPendingOutputs(pending_output_elem);
+    {
+      InstrumentedMutexLock l(&mutex_);
+      ReleaseFileNumberFromPendingOutputs(pending_output_elem);
+    }
+    NotifyOnExternalFileIngestionFinished(next_file_number, total);
     return status;
   }
 
@@ -6602,6 +6606,7 @@ Status DBImpl::IngestExternalFiles(
     // intended for atomicity.
     ingestion_jobs[i].Cleanup(status);
   }
+  NotifyOnExternalFileIngestionFinished(next_file_number, total);
   if (status.ok()) {
     for (size_t i = 0; i != num_cfs; ++i) {
       auto* cfd =
@@ -6656,6 +6661,7 @@ Status DBImpl::CreateColumnFamilyWithImport(
   SuperVersionContext dummy_sv_ctx(/* create_superversion */ true);
   VersionEdit dummy_edit;
   uint64_t next_file_number = 0;
+  bool file_numbers_reserved = false;
   std::unique_ptr<std::list<uint64_t>::iterator> pending_output_elem;
   {
     // Lock db mutex
@@ -6675,6 +6681,7 @@ Status DBImpl::CreateColumnFamilyWithImport(
       // and this will overwrite the external file. To protect the external
       // file, we have to make sure the file number will never being reused.
       next_file_number = versions_->FetchAddFileNumber(total_file_num);
+      file_numbers_reserved = true;
       auto cf_options = cfd->GetLatestMutableCFOptions();
       status =
           versions_->LogAndApply(cfd, *cf_options, read_options, write_options,
@@ -6685,6 +6692,9 @@ Status DBImpl::CreateColumnFamilyWithImport(
     }
   }
   dummy_sv_ctx.Clean();
+  if (file_numbers_reserved) {
+    NotifyOnExternalFileIngestionStarted(next_file_number, total_file_num);
+  }
 
   if (status.ok()) {
     SuperVersion* sv = cfd->GetReferencedSuperVersion(this);
@@ -6744,6 +6754,9 @@ Status DBImpl::CreateColumnFamilyWithImport(
   }
 
   import_job.Cleanup(status);
+  if (file_numbers_reserved) {
+    NotifyOnExternalFileIngestionFinished(next_file_number, total_file_num);
+  }
   if (!status.ok()) {
     Status temp_s = DropColumnFamily(*handle);
     if (!temp_s.ok()) {
@@ -7031,6 +7044,24 @@ void DBImpl::NotifyOnExternalFileIngested(
     info.table_properties = f.table_properties;
     for (const auto& listener : immutable_db_options_.listeners) {
       listener->OnExternalFileIngested(this, info);
+    }
+  }
+}
+
+void DBImpl::NotifyOnExternalFileIngestionStarted(uint64_t first_file_number,
+                                                  size_t file_count) {
+  for (size_t i = 0; i < file_count; ++i) {
+    for (const auto& listener : immutable_db_options_.listeners) {
+      listener->OnExternalFileIngestionStarted(this, first_file_number + i);
+    }
+  }
+}
+
+void DBImpl::NotifyOnExternalFileIngestionFinished(uint64_t first_file_number,
+                                                   size_t file_count) {
+  for (size_t i = 0; i < file_count; ++i) {
+    for (const auto& listener : immutable_db_options_.listeners) {
+      listener->OnExternalFileIngestionFinished(this, first_file_number + i);
     }
   }
 }

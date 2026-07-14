@@ -16,6 +16,22 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+class ImportFileLifecycleListener : public EventListener {
+ public:
+  void OnExternalFileIngestionStarted(DB* /*db*/,
+                                      uint64_t file_number) override {
+    started_file_numbers.push_back(file_number);
+  }
+
+  void OnExternalFileIngestionFinished(DB* /*db*/,
+                                       uint64_t file_number) override {
+    finished_file_numbers.push_back(file_number);
+  }
+
+  std::vector<uint64_t> started_file_numbers;
+  std::vector<uint64_t> finished_file_numbers;
+};
+
 class ImportColumnFamilyTest : public DBTestBase {
  public:
   ImportColumnFamilyTest()
@@ -157,6 +173,8 @@ TEST_F(ImportColumnFamilyTest, ImportSSTFileWriterFiles) {
 
 TEST_F(ImportColumnFamilyTest, ImportSSTFileWriterFilesWithOverlap) {
   Options options = CurrentOptions();
+  auto listener = std::make_shared<ImportFileLifecycleListener>();
+  options.listeners.emplace_back(listener);
   CreateAndReopenWithCF({"koko"}, options);
 
   SstFileWriter sfw_cf1(EnvOptions(), options, handles_[1]);
@@ -234,6 +252,12 @@ TEST_F(ImportColumnFamilyTest, ImportSSTFileWriterFilesWithOverlap) {
   ASSERT_OK(db_->CreateColumnFamilyWithImport(
       options, "toto", ImportColumnFamilyOptions(), metadata, &import_cfh_));
   ASSERT_NE(import_cfh_, nullptr);
+  ASSERT_EQ(listener->started_file_numbers.size(), metadata.files.size());
+  ASSERT_EQ(listener->finished_file_numbers, listener->started_file_numbers);
+  for (size_t i = 1; i < listener->started_file_numbers.size(); ++i) {
+    ASSERT_EQ(listener->started_file_numbers[i],
+              listener->started_file_numbers[i - 1] + 1);
+  }
 
   for (int i = 0; i < 100; i++) {
     std::string value;
@@ -637,6 +661,8 @@ TEST_F(ImportColumnFamilyTest, LevelFilesOverlappingAtEndpoints) {
 
 TEST_F(ImportColumnFamilyTest, ImportColumnFamilyNegativeTest) {
   Options options = CurrentOptions();
+  auto listener = std::make_shared<ImportFileLifecycleListener>();
+  options.listeners.emplace_back(listener);
   CreateAndReopenWithCF({"koko"}, options);
 
   {
@@ -748,6 +774,8 @@ TEST_F(ImportColumnFamilyTest, ImportColumnFamilyNegativeTest) {
                                                 metadata, &import_cfh_));
     ASSERT_NE(import_cfh_, nullptr);
   }
+  ASSERT_EQ(listener->started_file_numbers.size(), 5);
+  ASSERT_EQ(listener->finished_file_numbers, listener->started_file_numbers);
 }
 
 TEST_F(ImportColumnFamilyTest, ImportMultiColumnFamilyTest) {
@@ -888,4 +916,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-

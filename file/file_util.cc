@@ -92,8 +92,12 @@ IOStatus CopyFile(FileSystem* fs, const std::string& source,
         new WritableFileWriter(std::move(destfile), destination, options));
   }
 
-  return CopyFile(fs, source, src_temp_hint, dest_writer, size, use_fsync,
+  io_s = CopyFile(fs, source, src_temp_hint, dest_writer, size, use_fsync,
                   io_tracer);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  return dest_writer->Close(IOOptions());
 }
 
 // Utility function to create a file with the provided contents
