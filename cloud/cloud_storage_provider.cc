@@ -176,34 +176,24 @@ IOStatus CloudStorageWritableFileImpl::Close(const IOOptions& opts,
   local_file_.reset();
 
   if (!is_manifest_) {
-    bool uploaded = false;
     auto* cfs_impl = dynamic_cast<CloudFileSystemImpl*>(cfs_);
-    if (cfs_impl != nullptr) {
-      auto publisher = cfs_impl->GetFileNumberGuardPublisher();
-      if (publisher) {
-        uint64_t file_number = 0;
-        FileType file_type;
-        const std::string logical_name = basename(RemoveEpoch(fname_));
-        const bool parsed =
-            ParseFileName(logical_name, &file_number, &file_type);
-        if (!parsed && IsSstFile(logical_name)) {
-          status_ = IOStatus::InvalidArgument("cannot parse SST file number",
-                                              logical_name);
-          return status_;
-        }
-        if (parsed && file_type == kTableFile) {
-          Status protection = publisher->ProtectFileUpload(file_number, [&] {
-            status_ = cfs_->CopyLocalFileToDest(fname_, cloud_fname_);
-          });
-          if (!protection.ok()) {
-            status_ = status_to_io_status(std::move(protection));
-            return status_;
-          }
-          uploaded = true;
-        }
-      }
+    auto publisher =
+        cfs_impl == nullptr ? nullptr : cfs_impl->GetFileNumberGuardPublisher();
+    uint64_t file_number = 0;
+    FileType file_type;
+    const std::string logical_name = basename(RemoveEpoch(fname_));
+    const bool parsed = ParseFileName(logical_name, &file_number, &file_type);
+    if (publisher && !parsed && IsSstFile(logical_name)) {
+      status_ = IOStatus::InvalidArgument("cannot parse SST file number",
+                                          logical_name);
+      return status_;
     }
-    if (!uploaded) {
+    if (publisher && parsed && file_type == kTableFile) {
+      Status protection = publisher->ProtectFileUpload(file_number, [&] {
+        return cfs_->CopyLocalFileToDest(fname_, cloud_fname_);
+      });
+      status_ = status_to_io_status(std::move(protection));
+    } else {
       status_ = cfs_->CopyLocalFileToDest(fname_, cloud_fname_);
     }
     if (!status_.ok()) {

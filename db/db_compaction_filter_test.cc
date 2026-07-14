@@ -970,14 +970,43 @@ TEST_F(DBTestCompactionFilter, IgnoreSnapshotsFalseDuringFlush) {
 }
 
 TEST_F(DBTestCompactionFilter, IgnoreSnapshotsFalseRecovery) {
+  class RecoveryCreationListener : public EventListener {
+  public:
+    void OnTableFileCreationStarted(
+        const TableFileCreationBriefInfo &info) override {
+      if (info.reason == TableFileCreationReason::kRecovery) {
+        ++started;
+      }
+    }
+
+    void OnTableFileCreated(const TableFileCreationInfo &info) override {
+      if (info.reason == TableFileCreationReason::kRecovery) {
+        ++finished;
+        file_path = info.file_path;
+        status = info.status;
+      }
+    }
+
+    int started = 0;
+    int finished = 0;
+    std::string file_path;
+    Status status;
+  };
+
+  auto listener = std::make_shared<RecoveryCreationListener>();
   Options options = CurrentOptions();
   options.compaction_filter_factory =
       std::make_shared<TestNotSupportedFilterFactory>(
           TableFileCreationReason::kRecovery);
+  options.listeners.emplace_back(listener);
   Reopen(options);
 
   ASSERT_OK(Put("a", "v10"));
   ASSERT_TRUE(TryReopen(options).IsNotSupported());
+  ASSERT_EQ(listener->started, 1);
+  ASSERT_EQ(listener->finished, 1);
+  ASSERT_EQ(listener->file_path, "(nil)");
+  ASSERT_TRUE(listener->status.IsNotSupported());
 }
 
 TEST_F(DBTestCompactionFilter, DropKeyWithSingleDelete) {

@@ -32,9 +32,12 @@
 
 #include "cloud/cloud_manifest.h"
 #include "cloud/cloud_scheduler.h"
+#include "cloud/filename.h"
+#include "file/filename.h"
 #include "rocksdb/cloud/cloud_file_system_impl.h"
 #include "rocksdb/cloud/cloud_storage_provider.h"
 #include "rocksdb/db.h"
+#include "rocksdb/env.h"
 #include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -217,15 +220,14 @@ Status FileNumberGuardPublisher::PutValue(uint64_t value,
   return PutSmallestFileNumberObject(cfs_, value, epoch);
 }
 
-Status FileNumberGuardPublisher::OnJobBegin(uint64_t file_number,
-                                            uint64_t thread_id, int job_id) {
+void FileNumberGuardPublisher::OnJobBegin(uint64_t file_number,
+                                          uint64_t thread_id, int job_id) {
   std::lock_guard<std::mutex> lk(state_mutex_);
   window_.Add(file_number, thread_id, job_id);
-  return Status::OK();
 }
 
 Status FileNumberGuardPublisher::ProtectFileUpload(
-    uint64_t file_number, const std::function<void()> &upload) {
+    uint64_t file_number, const std::function<Status()> &upload) {
   {
     std::lock_guard<std::mutex> lk(stop_mutex_);
     if (stopped_) {
@@ -253,7 +255,8 @@ Status FileNumberGuardPublisher::ProtectFileUpload(
       return Status::InvalidArgument(
           "live file number minimum exceeds SST file number");
     }
-    needs_publish = desired < last_published_;
+    needs_publish =
+        !sentinel_active_ && (remote_unknown_ || desired < last_published_);
   }
 
   if (needs_publish) {
@@ -278,12 +281,12 @@ Status FileNumberGuardPublisher::ProtectFileUpload(
       st = PutValue(desired, epoch);
       if (st.ok()) {
         std::lock_guard<std::mutex> lk(state_mutex_);
-        if (desired < last_published_) {
-          last_published_ = desired;
-        }
-        sentinel_dirty_ = false;
+        last_published_ = desired;
+        sentinel_active_ = false;
+        remote_unknown_ = false;
         break;
       }
+      MarkRemoteUnknown();
       Log(InfoLogLevel::WARN_LEVEL, cfs_->info_log_,
           "[fng] Downward publish of %llu for SST %llu failed (%s); retrying "
           "in %lld ms",
@@ -308,7 +311,7 @@ Status FileNumberGuardPublisher::ProtectFileUpload(
     }
   }
   if (upload) {
-    upload();
+    return upload();
   }
   return Status::OK();
 }
@@ -326,16 +329,13 @@ Status FileNumberGuardPublisher::BlockPurger() {
     return Status::InvalidArgument("empty epoch for file number guard");
   }
   std::lock_guard<std::mutex> publish_lk(publish_mutex_);
-  // Deliberately does NOT touch last_published_: the sentinel is transient
-  // ("blocked until the writer proves otherwise") and any future smaller
-  // real value must still trigger a downward publish.
   Status st = PutValue(0, epoch);
   if (st.ok()) {
-    // S3 now holds 0 while last_published_ is unchanged; mark the mismatch
-    // so the next periodic publish refreshes the object even if the window
-    // minimum still equals last_published_ (e.g. idle -> UINT64_MAX).
     std::lock_guard<std::mutex> lk(state_mutex_);
-    sentinel_dirty_ = true;
+    sentinel_active_ = true;
+    remote_unknown_ = false;
+  } else {
+    MarkRemoteUnknown();
   }
   return st;
 }
@@ -352,7 +352,7 @@ void FileNumberGuardPublisher::PeriodicPublish() {
   {
     std::lock_guard<std::mutex> lk(state_mutex_);
     desired = window_.SmallestFileNumber();
-    if (desired == last_published_ && !sentinel_dirty_) {
+    if (desired == last_published_ && !sentinel_active_ && !remote_unknown_) {
       return;
     }
   }
@@ -385,7 +385,7 @@ void FileNumberGuardPublisher::PeriodicPublish() {
     // older, higher value.
     std::lock_guard<std::mutex> lk(state_mutex_);
     desired = window_.SmallestFileNumber();
-    if (desired == last_published_ && !sentinel_dirty_) {
+    if (desired == last_published_ && !sentinel_active_ && !remote_unknown_) {
       return;
     }
   }
@@ -394,10 +394,18 @@ void FileNumberGuardPublisher::PeriodicPublish() {
   if (st.ok()) {
     std::lock_guard<std::mutex> lk(state_mutex_);
     last_published_ = desired;
-    sentinel_dirty_ = false;
+    sentinel_active_ = false;
+    remote_unknown_ = false;
+  } else {
+    MarkRemoteUnknown();
   }
-  // On failure last_published_ is unchanged; the next tick retries. Upward
-  // movement is not urgent, so no synchronous retry here.
+}
+
+void FileNumberGuardPublisher::MarkRemoteUnknown() {
+  std::lock_guard<std::mutex> lk(state_mutex_);
+  last_published_ = std::numeric_limits<uint64_t>::max();
+  sentinel_active_ = false;
+  remote_unknown_ = true;
 }
 
 uint64_t FileNumberGuardPublisher::TEST_LastPublished() {
@@ -412,8 +420,8 @@ void FileNumberGuardListener::JobBegin(uint64_t file_number, uint64_t thread_id,
   if (!publisher_) {
     return;
   }
-  Status s = publisher_->OnJobBegin(file_number, thread_id, job_id);
-  s.PermitUncheckedError();
+  assert(job_id >= 0);
+  publisher_->OnJobBegin(file_number, thread_id, job_id);
 }
 
 void FileNumberGuardListener::OnFlushBegin(DB *db, const FlushJobInfo &info) {
@@ -454,6 +462,72 @@ void FileNumberGuardListener::OnCompactionCompleted(
   }
 }
 
+void FileNumberGuardListener::OnExternalFileIngestionStarted(
+    DB * /*db*/, uint64_t file_number) {
+  if (publisher_) {
+    publisher_->OnJobBegin(file_number, file_number, kExternalFileJobId);
+  }
+}
+
+void FileNumberGuardListener::OnExternalFileIngestionFinished(
+    DB * /*db*/, uint64_t file_number) {
+  if (publisher_) {
+    publisher_->OnJobEnd(file_number, kExternalFileJobId);
+  }
+}
+
+void FileNumberGuardListener::OnTableFileCreationStarted(
+    const TableFileCreationBriefInfo &info) {
+  if (!publisher_ || info.reason != TableFileCreationReason::kRecovery) {
+    return;
+  }
+
+  uint64_t file_number = 0;
+  FileType file_type;
+  const bool parsed =
+      ParseFileName(basename(info.file_path), &file_number, &file_type);
+  assert(parsed && file_type == kTableFile);
+  if (!parsed || file_type != kTableFile) {
+    return;
+  }
+
+  const uint64_t thread_id = Env::Default()->GetThreadID();
+  const RecoveryKey key(info.db_name, info.cf_name, info.job_id);
+  {
+    std::lock_guard<std::mutex> lock(recovery_mutex_);
+    const bool inserted =
+        recovery_files_.emplace(key, RecoveryEntry{file_number, thread_id})
+            .second;
+    assert(inserted);
+    if (!inserted) {
+      return;
+    }
+  }
+  publisher_->OnJobBegin(file_number, file_number, kRecoveryJobId);
+}
+
+void FileNumberGuardListener::OnTableFileCreated(
+    const TableFileCreationInfo &info) {
+  if (!publisher_ || info.reason != TableFileCreationReason::kRecovery) {
+    return;
+  }
+
+  const RecoveryKey key(info.db_name, info.cf_name, info.job_id);
+  uint64_t file_number = 0;
+  {
+    std::lock_guard<std::mutex> lock(recovery_mutex_);
+    auto it = recovery_files_.find(key);
+    assert(it != recovery_files_.end());
+    if (it == recovery_files_.end()) {
+      return;
+    }
+    assert(it->second.thread_id == Env::Default()->GetThreadID());
+    file_number = it->second.file_number;
+    recovery_files_.erase(it);
+  }
+  publisher_->OnJobEnd(file_number, kRecoveryJobId);
+}
+
 // ---------------- CloudFileSystemImpl glue ----------------
 
 void CloudFileSystemImpl::SetFileNumberGuardPublisher(
@@ -462,6 +536,21 @@ void CloudFileSystemImpl::SetFileNumberGuardPublisher(
   if (previous) {
     previous->Stop();
   }
+}
+
+bool CloudFileSystemImpl::RemoveFileNumberGuardPublisher(
+    const std::shared_ptr<FileNumberGuardPublisher> &expected) {
+  if (!expected) {
+    return false;
+  }
+  auto current = expected;
+  if (!std::atomic_compare_exchange_strong(
+          &file_number_guard_, &current,
+          std::shared_ptr<FileNumberGuardPublisher>())) {
+    return false;
+  }
+  expected->Stop();
+  return true;
 }
 
 std::shared_ptr<FileNumberGuardPublisher>

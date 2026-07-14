@@ -375,6 +375,10 @@ struct FlushJobInfo {
 struct FlushJobEndInfo {
   ~FlushJobEndInfo() { status.PermitUncheckedError(); }
 
+  // The id of the column family.
+  uint32_t cf_id;
+  // The name of the column family.
+  std::string cf_name;
   // The id of the thread that ran the flush job.
   uint64_t thread_id;
   // The job id, which is unique in the same thread.
@@ -611,13 +615,6 @@ class EventListener : public Customizable {
   // returns.  Otherwise, RocksDB may be blocked.
   virtual void OnFlushBegin(DB* /*db*/,
                             const FlushJobInfo& /*flush_job_info*/) {}
-
-  // Called exactly once after every flush attempt whose OnFlushBegin callback
-  // was issued, after its final status is known. This includes failures and
-  // successful mempurges; OnFlushCompleted remains success-only and is not
-  // called for mempurges because they produce no SST.
-  virtual void OnFlushFinished(DB* /*db*/,
-                               const FlushJobEndInfo& /*flush_job_end_info*/) {}
 
   // A callback function for RocksDB which will be called whenever
   // a SST file is deleted.  Different from OnCompactionCompleted and
@@ -876,6 +873,14 @@ class EventListener : public Customizable {
   // OnExternalFileIngestionStarted(), whether the operation succeeds or fails.
   virtual void OnExternalFileIngestionFinished(DB* /*db*/,
                                                uint64_t /*file_number*/) {}
+
+  // Called exactly once after every flush attempt whose OnFlushBegin callback
+  // was issued, after its final status is known. This includes failures and
+  // successful mempurges; OnFlushCompleted remains success-only and is not
+  // called for mempurges because they produce no SST.
+  virtual void OnFlushFinished(DB * /*db*/,
+                               const FlushJobEndInfo & /*flush_job_end_info*/) {
+  }
 };
 
 

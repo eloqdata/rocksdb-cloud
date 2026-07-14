@@ -411,6 +411,8 @@ class CloudFileSystemImpl : public CloudFileSystem {
   // File number guard (defined in cloud/file_number_guard.cc).
   void SetFileNumberGuardPublisher(
       std::shared_ptr<FileNumberGuardPublisher> publisher);
+  bool RemoveFileNumberGuardPublisher(
+      const std::shared_ptr<FileNumberGuardPublisher> &expected);
   std::shared_ptr<FileNumberGuardPublisher> GetFileNumberGuardPublisher()
       const;
   void StopFileNumberGuard();

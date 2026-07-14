@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <algorithm>
 #include <atomic>
 #include <limits>
 #include <mutex>
@@ -90,8 +91,16 @@ class RecordingFlushLifecycleListener : public EventListener {
   void OnFlushFinished(DB* /*db*/, const FlushJobEndInfo& info) override {
     std::lock_guard<std::mutex> lock(mutex_);
     ++finished_count;
+    finished_column_families.emplace_back(info.cf_id, info.cf_name);
     status_ = info.status;
     switched_to_mempurge_ = info.switched_to_mempurge;
+  }
+
+  std::vector<std::pair<uint32_t, std::string>> finished_cfs() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto result = finished_column_families;
+    std::sort(result.begin(), result.end());
+    return result;
   }
 
   Status status() {
@@ -111,6 +120,7 @@ class RecordingFlushLifecycleListener : public EventListener {
 
  private:
   std::mutex mutex_;
+  std::vector<std::pair<uint32_t, std::string>> finished_column_families;
   Status status_;
   bool switched_to_mempurge_ = false;
 };
@@ -127,6 +137,8 @@ TEST_F(DBFlushTest, FlushFinishedReportsSuccess) {
   ASSERT_EQ(listener->begin_count.load(), 1);
   ASSERT_EQ(listener->completed_count.load(), 1);
   ASSERT_EQ(listener->finished_count.load(), 1);
+  ASSERT_EQ(listener->finished_cfs(),
+            (std::vector<std::pair<uint32_t, std::string>>{{0, "default"}}));
   ASSERT_OK(listener->status());
   ASSERT_FALSE(listener->switched_to_mempurge());
 }
@@ -210,6 +222,9 @@ TEST_F(DBFlushTest, AtomicFlushFinishesEachColumnFamily) {
   ASSERT_EQ(listener->begin_count.load(), 2);
   ASSERT_EQ(listener->completed_count.load(), 2);
   ASSERT_EQ(listener->finished_count.load(), 2);
+  ASSERT_EQ(listener->finished_cfs(),
+            (std::vector<std::pair<uint32_t, std::string>>{{0, "default"},
+                                                           {1, "pikachu"}}));
   ASSERT_OK(listener->status());
 }
 

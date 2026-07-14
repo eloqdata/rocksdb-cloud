@@ -350,7 +350,7 @@ TEST_F(FileNumberGuardTest, JobRegistrationDoesNotPublish) {
   FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
                                std::chrono::seconds(15));
 
-  ASSERT_OK(pub.OnJobBegin(42, 1, 1));
+  pub.OnJobBegin(42, 1, 1);
   ASSERT_EQ(provider_->PutCount(), 0);
   ASSERT_EQ(pub.TEST_LastPublished(), kMax);
 }
@@ -366,10 +366,20 @@ TEST_F(FileNumberGuardTest, SentinelDoesNotAdvanceWatermark) {
   // (necessarily > 0) still has to be published.
   ASSERT_EQ(pub.TEST_LastPublished(), kMax);
 
-  // First job after the sentinel publishes its (smaller-than-MAX) snapshot.
-  ASSERT_OK(pub.OnJobBegin(42, 1, 1));
+  // Protected uploads keep the known-safe sentinel in place until the
+  // post-open periodic publish replaces it.
+  pub.OnJobBegin(42, 1, 1);
   ASSERT_EQ(provider_->Content(GuardKey()), "0");
-  ASSERT_OK(pub.ProtectFileUpload(42));
+  bool uploaded = false;
+  ASSERT_OK(pub.ProtectFileUpload(42, [&] {
+    uploaded = true;
+    return Status::OK();
+  }));
+  ASSERT_TRUE(uploaded);
+  ASSERT_EQ(provider_->Content(GuardKey()), "0");
+  ASSERT_EQ(pub.TEST_LastPublished(), kMax);
+
+  pub.PeriodicPublish();
   ASSERT_EQ(provider_->Content(GuardKey()), "42");
   ASSERT_EQ(pub.TEST_LastPublished(), 42u);
 }
@@ -396,19 +406,19 @@ TEST_F(FileNumberGuardTest, DownwardPublishTriggerCondition) {
   FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
                                std::chrono::seconds(15));
 
-  ASSERT_OK(pub.OnJobBegin(100, 1, 1));
+  pub.OnJobBegin(100, 1, 1);
   ASSERT_EQ(provider_->PutCount(), 0);
   ASSERT_OK(pub.ProtectFileUpload(100));
   int puts_after_first = provider_->PutCount();
   ASSERT_EQ(provider_->Content(GuardKey()), "100");
 
   // A job at or above the watermark publishes nothing.
-  ASSERT_OK(pub.OnJobBegin(200, 2, 2));
-  ASSERT_OK(pub.OnJobBegin(100, 3, 3));
+  pub.OnJobBegin(200, 2, 2);
+  pub.OnJobBegin(100, 3, 3);
   ASSERT_EQ(provider_->PutCount(), puts_after_first);
 
   // A job below the watermark publishes synchronously.
-  ASSERT_OK(pub.OnJobBegin(50, 4, 4));
+  pub.OnJobBegin(50, 4, 4);
   ASSERT_OK(pub.ProtectFileUpload(50));
   ASSERT_EQ(provider_->Content(GuardKey()), "50");
   ASSERT_EQ(pub.TEST_LastPublished(), 50u);
@@ -419,8 +429,8 @@ TEST_F(FileNumberGuardTest, ProtectPublishesLiveWindowMinimum) {
   FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
                                std::chrono::seconds(15));
 
-  ASSERT_OK(pub.OnJobBegin(100, 1, 1));
-  ASSERT_OK(pub.OnJobBegin(200, 2, 2));
+  pub.OnJobBegin(100, 1, 1);
+  pub.OnJobBegin(200, 2, 2);
   ASSERT_OK(pub.ProtectFileUpload(200));
 
   ASSERT_EQ(provider_->Content(GuardKey()), "100");
@@ -432,10 +442,10 @@ TEST_F(FileNumberGuardTest, ProtectWaitsForInFlightUpwardPublish) {
   FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
                                std::chrono::milliseconds(0));
 
-  ASSERT_OK(pub.OnJobBegin(50, 1, 1));
+  pub.OnJobBegin(50, 1, 1);
   ASSERT_OK(pub.ProtectFileUpload(50));
   pub.OnJobEnd(1, 1);
-  ASSERT_OK(pub.OnJobBegin(100, 2, 2));
+  pub.OnJobBegin(100, 2, 2);
 
   std::mutex block_mutex;
   std::condition_variable block_cv;
@@ -459,7 +469,7 @@ TEST_F(FileNumberGuardTest, ProtectWaitsForInFlightUpwardPublish) {
     block_cv.wait(lock, [&] { return upward_put_reached; });
   }
 
-  ASSERT_OK(pub.OnJobBegin(60, 3, 3));
+  pub.OnJobBegin(60, 3, 3);
   auto protection = std::async(std::launch::async,
                                [&] { return pub.ProtectFileUpload(60); });
   const auto state = protection.wait_for(std::chrono::milliseconds(100));
@@ -484,7 +494,7 @@ TEST_F(FileNumberGuardTest, ProtectRejectsMissingOrTooHighWindow) {
                                std::chrono::seconds(15));
 
   ASSERT_TRUE(pub.ProtectFileUpload(100).IsInvalidArgument());
-  ASSERT_OK(pub.OnJobBegin(200, 1, 1));
+  pub.OnJobBegin(200, 1, 1);
   ASSERT_TRUE(pub.ProtectFileUpload(100).IsInvalidArgument());
   ASSERT_EQ(provider_->PutCount(), 0);
 }
@@ -495,9 +505,9 @@ TEST_F(FileNumberGuardTest, PeriodicPublishesWindowMinThenMaxWhenIdle) {
   FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
                                std::chrono::milliseconds(50));
 
-  ASSERT_OK(pub.OnJobBegin(100, 1, 1));
+  pub.OnJobBegin(100, 1, 1);
   ASSERT_OK(pub.ProtectFileUpload(100));  // publishes 100 downward
-  ASSERT_OK(pub.OnJobBegin(200, 2, 2));  // no publish
+  pub.OnJobBegin(200, 2, 2);              // no publish
 
   // Window min is 100 == last published: periodic publish is a no-op.
   int puts = provider_->PutCount();
@@ -522,6 +532,113 @@ TEST_F(FileNumberGuardTest, PeriodicPublishesWindowMinThenMaxWhenIdle) {
   ASSERT_EQ(pub.TEST_LastPublished(), kMax);
 }
 
+TEST_F(FileNumberGuardTest,
+       AmbiguousPeriodicFailureRepairsFiniteAndRetriesIdle) {
+  LoadManifestWithEpoch("epoch1");
+  FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
+                               std::chrono::milliseconds(0));
+
+  pub.OnJobBegin(100, 1, 1);
+  ASSERT_OK(pub.ProtectFileUpload(100));
+  pub.OnJobEnd(1, 1);
+  pub.OnJobBegin(200, 2, 2);
+
+  std::atomic<bool> fail_next{true};
+  SyncPoint::GetInstance()->SetCallBack(
+      "FileNumberGuard::PutSmallestFileNumberObject:Status", [&](void *arg) {
+        if (fail_next.exchange(false)) {
+          *static_cast<IOStatus *>(arg) =
+              IOStatus::IOError("injected post-store failure");
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  // The provider stored 200, but the caller cannot know that after the error.
+  pub.PeriodicPublish();
+  ASSERT_EQ(provider_->Content(GuardKey()), "200");
+  ASSERT_EQ(pub.TEST_LastPublished(), kMax);
+
+  // Unknown remote state forces a finite repair even though MAX would
+  // otherwise suppress a downward comparison.
+  pub.OnJobBegin(150, 3, 3);
+  pub.PeriodicPublish();
+  ASSERT_EQ(provider_->Content(GuardKey()), "150");
+  ASSERT_EQ(pub.TEST_LastPublished(), 150u);
+
+  pub.OnJobEnd(2, 2);
+  pub.OnJobEnd(3, 3);
+  fail_next = true;
+  pub.PeriodicPublish();
+  ASSERT_EQ(provider_->Content(GuardKey()), std::to_string(kMax));
+  int puts_after_ambiguous_idle = provider_->PutCount();
+  ASSERT_EQ(pub.TEST_LastPublished(), kMax);
+
+  // desired == last == MAX must still retry while the remote state is
+  // unknown.
+  pub.PeriodicPublish();
+  ASSERT_EQ(provider_->PutCount(), puts_after_ambiguous_idle + 1);
+  ASSERT_EQ(pub.TEST_LastPublished(), kMax);
+}
+
+TEST_F(FileNumberGuardTest, ListenerSeparatesIngestionAndRecoveryDomains) {
+  LoadManifestWithEpoch("epoch1");
+  auto pub = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::milliseconds(0));
+  FileNumberGuardListener listener(pub);
+
+  listener.OnExternalFileIngestionStarted(nullptr, 77);
+  TableFileCreationBriefInfo started;
+  started.db_name = "db";
+  started.cf_name = "default";
+  started.file_path = "/tmp/000077.sst";
+  started.job_id = 9;
+  started.reason = TableFileCreationReason::kRecovery;
+  listener.OnTableFileCreationStarted(started);
+
+  listener.OnExternalFileIngestionFinished(nullptr, 77);
+  ASSERT_OK(pub->ProtectFileUpload(77));
+
+  TableFileCreationInfo finished;
+  finished.db_name = started.db_name;
+  finished.cf_name = started.cf_name;
+  finished.file_path = "(nil)";
+  finished.job_id = started.job_id;
+  finished.reason = started.reason;
+  finished.status = Status::Aborted("empty recovery output");
+  listener.OnTableFileCreated(finished);
+  finished.status.PermitUncheckedError();
+
+  ASSERT_TRUE(pub->ProtectFileUpload(77).IsInvalidArgument());
+
+  started.file_path = "/tmp/000078.sst";
+  started.job_id = 10;
+  listener.OnTableFileCreationStarted(started);
+  ASSERT_OK(pub->ProtectFileUpload(78));
+
+  finished.file_path = started.file_path;
+  finished.job_id = started.job_id;
+  finished.status = Status::OK();
+  listener.OnTableFileCreated(finished);
+  ASSERT_TRUE(pub->ProtectFileUpload(78).IsInvalidArgument());
+}
+
+TEST_F(FileNumberGuardTest, ConditionalPublisherRemovalPreservesReplacement) {
+  LoadManifestWithEpoch("epoch1");
+  auto old = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+  auto replacement = std::make_shared<FileNumberGuardPublisher>(
+      cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
+  cfs_->SetFileNumberGuardPublisher(old);
+  cfs_->SetFileNumberGuardPublisher(replacement);
+
+  ASSERT_TRUE(old->ProtectFileUpload(1).IsShutdownInProgress());
+  ASSERT_FALSE(cfs_->RemoveFileNumberGuardPublisher(old));
+  ASSERT_EQ(cfs_->GetFileNumberGuardPublisher(), replacement);
+  ASSERT_TRUE(cfs_->RemoveFileNumberGuardPublisher(replacement));
+  ASSERT_EQ(cfs_->GetFileNumberGuardPublisher(), nullptr);
+  ASSERT_TRUE(replacement->ProtectFileUpload(1).IsShutdownInProgress());
+}
+
 // Failure injection: the downward PUT fails; the publisher must retry and
 // must not advance the watermark past the failure.
 TEST_F(FileNumberGuardTest, DownwardPublishFailureRetriesWithoutAdvancing) {
@@ -543,7 +660,7 @@ TEST_F(FileNumberGuardTest, DownwardPublishFailureRetriesWithoutAdvancing) {
 
   // Run the downward publish on a separate thread: it blocks (retrying)
   // until the PUT succeeds.
-  ASSERT_OK(pub.OnJobBegin(10, 1, 1));
+  pub.OnJobBegin(10, 1, 1);
   Status job_status;
   std::thread job([&] { job_status = pub.ProtectFileUpload(10); });
 
@@ -574,7 +691,7 @@ TEST_F(FileNumberGuardTest, StopUnblocksFailingDownwardPublish) {
 
   std::atomic<bool> returned{false};
   Status job_status;
-  ASSERT_OK(pub.OnJobBegin(10, 1, 1));
+  pub.OnJobBegin(10, 1, 1);
   std::thread job([&] {
     job_status = pub.ProtectFileUpload(10);
     returned = true;
@@ -600,7 +717,7 @@ TEST_F(FileNumberGuardTest, EmptyEpochPublishRefused) {
   FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
                                std::chrono::seconds(15));
 
-  ASSERT_OK(pub.OnJobBegin(10, 1, 1));
+  pub.OnJobBegin(10, 1, 1);
   ASSERT_TRUE(pub.ProtectFileUpload(10).IsInvalidArgument());
   ASSERT_TRUE(pub.BlockPurger().IsInvalidArgument());
   pub.PeriodicPublish();
@@ -620,7 +737,7 @@ TEST_F(FileNumberGuardTest, StartStopSchedulerSmoke) {
       cfs_.get(), std::chrono::milliseconds(20),
       std::chrono::milliseconds(10));
   pub->Start();
-  ASSERT_OK(pub->OnJobBegin(7, 1, 1));
+  pub->OnJobBegin(7, 1, 1);
   ASSERT_OK(pub->ProtectFileUpload(7));
   pub->OnJobEnd(1, 1);
   // Let the recurring job run at least once (idle -> MAX eventually).
@@ -648,7 +765,7 @@ TEST_F(FileNumberGuardTest, StoppedPublisherRejectsSstUpload) {
   LoadManifestWithEpoch("epoch1");
   auto pub = std::make_shared<FileNumberGuardPublisher>(
       cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
-  ASSERT_OK(pub->OnJobBegin(123, 1, 1));
+  pub->OnJobBegin(123, 1, 1);
   cfs_->SetFileNumberGuardPublisher(pub);
   pub->Stop();
 
@@ -667,7 +784,7 @@ TEST_F(FileNumberGuardTest, StopDuringGuardPublishPreventsSstUpload) {
   LoadManifestWithEpoch("epoch1");
   auto pub = std::make_shared<FileNumberGuardPublisher>(
       cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
-  ASSERT_OK(pub->OnJobBegin(123, 1, 1));
+  pub->OnJobBegin(123, 1, 1);
   cfs_->SetFileNumberGuardPublisher(pub);
 
   std::mutex mutex;
@@ -732,7 +849,7 @@ TEST_F(FileNumberGuardTest, StopWaitsForProtectedSstUpload) {
   LoadManifestWithEpoch("epoch1");
   auto pub = std::make_shared<FileNumberGuardPublisher>(
       cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
-  ASSERT_OK(pub->OnJobBegin(123, 1, 1));
+  pub->OnJobBegin(123, 1, 1);
   cfs_->SetFileNumberGuardPublisher(pub);
 
   const std::string local_path = tmp_dir_ + "/000123.sst-epoch1";
@@ -836,7 +953,7 @@ TEST_F(FileNumberGuardTest, ProtectedSstUploadFailurePropagates) {
   LoadManifestWithEpoch("epoch1");
   auto pub = std::make_shared<FileNumberGuardPublisher>(
       cfs_.get(), std::chrono::seconds(30), std::chrono::seconds(15));
-  ASSERT_OK(pub->OnJobBegin(123, 1, 1));
+  pub->OnJobBegin(123, 1, 1);
   cfs_->SetFileNumberGuardPublisher(pub);
 
   const std::string local_path = tmp_dir_ + "/000123.sst-epoch1";

@@ -1479,8 +1479,8 @@ class DBImpl : public DB {
       ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
       std::list<std::unique_ptr<FlushJobInfo>>* flush_jobs_info);
 
-  void NotifyOnFlushFinished(int job_id, const Status& status,
-                             bool switched_to_mempurge);
+  void NotifyOnFlushFinished(ColumnFamilyData *cfd, int job_id,
+                             const Status &status, bool switched_to_mempurge);
 
   void NotifyOnCompactionBegin(ColumnFamilyData* cfd, Compaction* c,
                                const Status& st,

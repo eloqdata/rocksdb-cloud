@@ -361,9 +361,9 @@ TEST_F(EloqPurgerIntegrationTest, PurgeEndToEnd) {
                                                             object_path_);
 }
 
-// End-to-end test of the smallest_new_file_number guard: sentinel at open,
-// downward publish on flush (before the SST reaches the cloud), idle decay
-// to UINT64_MAX, and the purger honoring the threshold.
+// End-to-end test of the smallest_new_file_number guard: the open-time
+// sentinel is replaced before Open returns, flush publishes downward before
+// its SST reaches the cloud, and the purger honors the threshold.
 TEST_F(EloqPurgerIntegrationTest, FileNumberGuardEndToEnd) {
   if (!Configured()) {
     ROCKSDB_GTEST_SKIP(
@@ -373,8 +373,7 @@ TEST_F(EloqPurgerIntegrationTest, FileNumberGuardEndToEnd) {
   }
 
   guard_enabled_ = true;
-  // Long enough that the sentinel assertion right after open cannot race the
-  // first periodic publish; short enough that idle-decay loops stay quick.
+  // Keep the background refresh and idle-decay loops reasonably quick.
   guard_publish_interval_ = std::chrono::seconds(3);
   guard_entry_duration_ = std::chrono::seconds(2);
   const std::string kMaxStr =
@@ -401,9 +400,9 @@ TEST_F(EloqPurgerIntegrationTest, FileNumberGuardEndToEnd) {
   CloudSession observe_session;
   ASSERT_OK(OpenSession(&observe_session, /*verbose_logging=*/true));
 
-  // (1) Sentinel: the marker exists and is 0 right after open, before any
-  // flush and before the first periodic publish could rewrite it.
-  ASSERT_EQ(ReadGuardMarker(&observe_session, epoch), "0");
+  // (1) Open replaces its temporary 0 sentinel with the idle watermark before
+  // returning, so the epoch does not remain unnecessarily blocked.
+  ASSERT_EQ(ReadGuardMarker(&observe_session, epoch), kMaxStr);
 
   // (2) Flush: the downward publish lands a real value <= the flushed SST's
   // file number, synchronously within the flush.
@@ -495,7 +494,8 @@ TEST_F(EloqPurgerIntegrationTest, FileNumberGuardEndToEnd) {
 
   auto publisher = db_session.cfs_impl->GetFileNumberGuardPublisher();
   ASSERT_TRUE(publisher != nullptr);
-  ASSERT_OK(publisher->OnJobBegin(1, /*thread*/ 424242, /*job*/ 1));
+  publisher->OnJobBegin(1, /*thread*/ 424242, /*job*/ 1);
+  publisher->PeriodicPublish();
   ASSERT_EQ(ReadGuardMarker(&observe_session, epoch), "1");
 
   EloqPurger purger(observe_session.cfs_impl, bucket_, object_path_,

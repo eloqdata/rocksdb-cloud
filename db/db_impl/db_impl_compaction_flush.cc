@@ -441,7 +441,7 @@ Status DBImpl::FlushMemTableToOutputFile(
       }
     }
   }
-  NotifyOnFlushFinished(job_context->job_id, s, switched_to_mempurge);
+  NotifyOnFlushFinished(cfd, job_context->job_id, s, switched_to_mempurge);
   TEST_SYNC_POINT("DBImpl::FlushMemTableToOutputFile:Finish");
   return s;
 }
@@ -938,7 +938,8 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
   }
 
   for (int i = 0; i != num_cfs; ++i) {
-    NotifyOnFlushFinished(job_context->job_id, s, switched_to_mempurge[i]);
+    NotifyOnFlushFinished(cfds[i], job_context->job_id, s,
+                          switched_to_mempurge[i]);
   }
 
   return s;
@@ -1024,16 +1025,19 @@ void DBImpl::NotifyOnFlushCompleted(
   // flush process.
 }
 
-void DBImpl::NotifyOnFlushFinished(int job_id, const Status& status,
+void DBImpl::NotifyOnFlushFinished(ColumnFamilyData *cfd, int job_id,
+                                   const Status &status,
                                    bool switched_to_mempurge) {
   if (immutable_db_options_.listeners.empty()) {
     return;
   }
   mutex_.AssertHeld();
+  const uint32_t cf_id = cfd->GetID();
+  const std::string cf_name = cfd->GetName();
   mutex_.Unlock();
   {
-    FlushJobEndInfo info{env_->GetThreadID(), job_id, status,
-                         switched_to_mempurge};
+    FlushJobEndInfo info{cf_id,  cf_name, env_->GetThreadID(),
+                         job_id, status,  switched_to_mempurge};
     for (const auto& listener : immutable_db_options_.listeners) {
       listener->OnFlushFinished(this, info);
     }

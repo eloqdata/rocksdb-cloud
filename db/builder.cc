@@ -130,10 +130,15 @@ Status BuildTable(
           ioptions.compaction_filter_factory->CreateCompactionFilter(context);
       if (compaction_filter != nullptr &&
           !compaction_filter->IgnoreSnapshots()) {
-        s.PermitUncheckedError();
-        return Status::NotSupported(
+        s = Status::NotSupported(
             "CompactionFilter::IgnoreSnapshots() = false is not supported "
             "anymore.");
+        EventHelpers::LogAndNotifyTableFileCreationFinished(
+            event_logger, ioptions.listeners, dbname,
+            tboptions.column_family_name, "(nil)", job_id, meta->fd,
+            kInvalidBlobFileNumber, tp, tboptions.reason, s, file_checksum,
+            file_checksum_func_name);
+        return s;
       }
     }
 

@@ -729,6 +729,9 @@ class CloudFileSystem : public FileSystem {
   // REQUIRES: stop writes, stop compactions
   virtual IOStatus BackupCloudManifest(const std::string& dest_folder, std::vector<std::string> &backup_files) = 0;
 
+  virtual Logger *GetLogger() const = 0;
+  virtual void SetLogger(std::shared_ptr<Logger>) = 0;
+
   // Publishes the 0 sentinel for the current epoch's
   // smallest_new_file_number guard object, blocking the standalone purger
   // for this epoch until the next periodic publish. Embedding storage layers
@@ -738,9 +741,6 @@ class CloudFileSystem : public FileSystem {
   virtual Status BlockPurger() {
     return Status::NotSupported("BlockPurger not supported");
   }
-
-  virtual Logger* GetLogger() const = 0;
-  virtual void SetLogger(std::shared_ptr<Logger>) = 0;
 };
 
 //
