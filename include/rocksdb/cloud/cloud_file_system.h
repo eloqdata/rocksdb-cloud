@@ -569,6 +569,9 @@ struct CloudManifestDelta {
 class CloudFileSystem : public FileSystem {
  public:
   static const char* kCloud() { return "cloud"; }
+  // Lets callers reach a CloudFileSystem through Customizable::CheckedCast
+  // without requiring RTTI.
+  static const char* kClassName() { return kCloud(); }
   static const char* kAws() { return "aws"; }
   static char const* kGcp() { return "gcp"; }
 

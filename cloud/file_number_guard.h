@@ -33,6 +33,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include "rocksdb/listener.h"
 #include "rocksdb/status.h"
@@ -119,9 +120,17 @@ class FileNumberSlidingWindow {
 // members reached by publisher callbacks.
 class FileNumberGuardPublisher {
  public:
+  // db_directories lists every directory in which this DB may legitimately
+  // place its own SST files: the DB directory itself plus any configured
+  // db_paths/cf_paths. Files written elsewhere through the cloud file system
+  // (checkpoints, column family exports) are not DB-visible SSTs -- no
+  // flush/compaction job registers them and the purger never evaluates them
+  // as this DB's live or obsolete files -- so they are not gated. An empty
+  // list gates every SST, which is the conservative default.
   FileNumberGuardPublisher(CloudFileSystemImpl *cfs,
                            std::chrono::milliseconds publish_interval,
-                           std::chrono::milliseconds entry_duration);
+                           std::chrono::milliseconds entry_duration,
+                           std::vector<std::string> db_directories = {});
   ~FileNumberGuardPublisher();
 
   FileNumberGuardPublisher(const FileNumberGuardPublisher &) = delete;
@@ -158,6 +167,11 @@ class FileNumberGuardPublisher {
   // the embedder around leader transfer.
   Status BlockPurger();
 
+  // True when local_path lies in one of this DB's own SST directories, i.e.
+  // the file is a DB-visible SST that must be protected before upload.
+  // Always true when no directories were configured.
+  bool CoversFile(const std::string &local_path) const;
+
   // The periodic publish body: computes the window minimum (UINT64_MAX when
   // idle) and publishes it if it differs from the last published value or if
   // the remote value is a sentinel/unknown after an ambiguous PUT failure.
@@ -178,6 +192,9 @@ class FileNumberGuardPublisher {
 
   CloudFileSystemImpl *cfs_;
   const std::chrono::milliseconds publish_interval_;
+  // Normalized (no trailing separator) directories holding this DB's SSTs.
+  // Immutable after construction, so it needs no lock.
+  const std::vector<std::string> db_directories_;
 
   std::mutex state_mutex_;
   FileNumberSlidingWindow window_;

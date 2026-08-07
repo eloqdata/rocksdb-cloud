@@ -39,9 +39,12 @@
 #include "rocksdb/cloud/cloud_file_system.h"
 #include "rocksdb/cloud/cloud_file_system_impl.h"
 #include "rocksdb/cloud/cloud_storage_provider.h"
+#include "rocksdb/cloud/db_cloud.h"
 #include "rocksdb/cloud/cloud_storage_provider_impl.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/db.h"
 #include "rocksdb/env.h"
+#include "rocksdb/options.h"
 #include "rocksdb/utilities/options_type.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
@@ -861,6 +864,66 @@ TEST_F(FileNumberGuardTest, BlockPurgerOnFileSystemWithoutPublisher) {
   ASSERT_EQ(provider_->Content(GuardKey()), "0");
 }
 
+// Files written outside the DB's own SST directories (a Checkpoint copy, a
+// column family export) are not DB-visible SSTs: they must not be gated, or
+// the copy would fail with "no live file number registration" because no
+// flush/compaction job ever registers them.
+TEST_F(FileNumberGuardTest, CoversFileOnlyInsideDbDirectories) {
+  LoadManifestWithEpoch("epoch1");
+  FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
+                               std::chrono::seconds(15),
+                               {"/data/db", "/data/extra_path/"});
+
+  // The DB directory itself, and a configured db_path (trailing separator
+  // normalized on both sides).
+  ASSERT_TRUE(pub.CoversFile("/data/db/000123.sst-epoch1"));
+  ASSERT_TRUE(pub.CoversFile("/data/extra_path/000124.sst-epoch1"));
+
+  // Checkpoint copies live under their own directory tree.
+  ASSERT_FALSE(pub.CoversFile("/data/ckpt/private/1/000123.sst-epoch1"));
+  ASSERT_FALSE(pub.CoversFile("/data/export/000123.sst-epoch1"));
+  // A sibling directory sharing a prefix must not be treated as inside.
+  ASSERT_FALSE(pub.CoversFile("/data/db_backup/000123.sst-epoch1"));
+  // Nested subdirectories of the DB directory are not SST locations either.
+  ASSERT_FALSE(pub.CoversFile("/data/db/sub/000123.sst-epoch1"));
+}
+
+TEST_F(FileNumberGuardTest, CoversFileGatesEverythingWhenUnconfigured) {
+  LoadManifestWithEpoch("epoch1");
+  // No directories configured: fail safe by gating every SST rather than
+  // risking an unprotected upload.
+  FileNumberGuardPublisher pub(cfs_.get(), std::chrono::seconds(30),
+                               std::chrono::seconds(15));
+  ASSERT_TRUE(pub.CoversFile("/anywhere/000123.sst-epoch1"));
+}
+
+// RepairDB rebuilds SSTs without the guard listener (that is registered by
+// DBCloud::Open on its own options copy), so its uploads would bypass the
+// window and reach the cloud unprotected. It must refuse rather than write
+// files the purger may delete.
+TEST_F(FileNumberGuardTest, RepairDBRefusedWhenGuardEnabled) {
+  LoadManifestWithEpoch("epoch1");
+  auto env = CloudFileSystemEnv::NewCompositeEnv(
+      Env::Default(), std::shared_ptr<FileSystem>(cfs_.get(), [](FileSystem*) {
+      }));
+
+  Options options;
+  options.env = env.get();
+
+  cfs_->GetMutableCloudFileSystemOptions().publish_file_number_guard = true;
+  Status guarded = RepairDB(tmp_dir_, options);
+  ASSERT_TRUE(guarded.IsNotSupported()) << guarded.ToString();
+
+  // With the guard disabled the check must not fire; repair proceeds far
+  // enough to fail on its own terms (this directory is not a database), which
+  // is any status other than the guard's NotSupported message.
+  cfs_->GetMutableCloudFileSystemOptions().publish_file_number_guard = false;
+  Status unguarded = RepairDB(tmp_dir_, options);
+  ASSERT_EQ(unguarded.ToString().find("publish_file_number_guard"),
+            std::string::npos)
+      << unguarded.ToString();
+}
+
 TEST_F(FileNumberGuardTest, StartStopSchedulerSmoke) {
   LoadManifestWithEpoch("epoch1");
   auto pub = std::make_shared<FileNumberGuardPublisher>(
@@ -1105,6 +1168,70 @@ TEST_F(FileNumberGuardTest, ProtectedSstUploadFailurePropagates) {
   ASSERT_TRUE(status.IsIOError()) << status.ToString();
   ASSERT_FALSE(provider_->HasObject(object_path));
   ASSERT_EQ(provider_->Content(GuardKey()), "123");
+}
+
+
+// A writable DBCloud on a bucket whose deletion is delegated to the purger
+// must publish the guard; otherwise the purger cannot tell an in-flight
+// upload from garbage and its marker-absence fallback deletes live data.
+TEST_F(FileNumberGuardTest, OpenRejectsPurgedBucketWithoutGuard) {
+  auto env = CloudFileSystemEnv::NewCompositeEnv(
+      Env::Default(),
+      std::shared_ptr<FileSystem>(cfs_.get(), [](FileSystem *) {}));
+  Options options;
+  options.env = env.get();
+  options.create_if_missing = true;
+
+  auto &mutable_opts = cfs_->GetMutableCloudFileSystemOptions();
+  mutable_opts.disable_cloud_file_deletion = true;
+  mutable_opts.publish_file_number_guard = false;
+
+  DBCloud *db = nullptr;
+  Status s = DBCloud::Open(options, tmp_dir_ + "/guard_required", "", 0, &db);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_NE(s.ToString().find("publish_file_number_guard"), std::string::npos)
+      << s.ToString();
+  ASSERT_EQ(db, nullptr);
+
+  // A read-only open creates no SSTs, so it needs no guard and must not be
+  // rejected by this check.
+  Status read_only =
+      DBCloud::Open(options, tmp_dir_ + "/guard_required", "", 0, &db, true);
+  ASSERT_EQ(read_only.ToString().find("publish_file_number_guard"),
+            std::string::npos)
+      << read_only.ToString();
+}
+
+// The guard assumes a completed job's MANIFEST is durable in the cloud.
+// disable_manifest_sync removes the Sync() that uploads it, so the guard
+// could rise to UINT64_MAX while the cloud MANIFEST still omits committed
+// files.
+TEST_F(FileNumberGuardTest, OpenRejectsDisableManifestSyncWithGuard) {
+  auto env = CloudFileSystemEnv::NewCompositeEnv(
+      Env::Default(),
+      std::shared_ptr<FileSystem>(cfs_.get(), [](FileSystem *) {}));
+  Options options;
+  options.env = env.get();
+  options.create_if_missing = true;
+  options.disable_manifest_sync = true;
+
+  cfs_->GetMutableCloudFileSystemOptions().publish_file_number_guard = true;
+
+  DBCloud *db = nullptr;
+  Status s = DBCloud::Open(options, tmp_dir_ + "/manifest_sync", "", 0, &db);
+  ASSERT_TRUE(s.IsInvalidArgument()) << s.ToString();
+  ASSERT_NE(s.ToString().find("disable_manifest_sync"), std::string::npos)
+      << s.ToString();
+  ASSERT_EQ(db, nullptr);
+
+  // Without the guard the option is the caller's own risk, and this check
+  // must not fire.
+  cfs_->GetMutableCloudFileSystemOptions().publish_file_number_guard = false;
+  Status unguarded =
+      DBCloud::Open(options, tmp_dir_ + "/manifest_sync", "", 0, &db);
+  ASSERT_EQ(unguarded.ToString().find("disable_manifest_sync"),
+            std::string::npos)
+      << unguarded.ToString();
 }
 
 }  //  namespace ROCKSDB_NAMESPACE

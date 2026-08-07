@@ -75,8 +75,8 @@ IOStatus LocalManifestReader::GetManifestLiveFiles(
 }
 
 IOStatus LocalManifestReader::GetLiveFilesFromFileReader(
-    std::unique_ptr<SequentialFileReader> file_reader,
-    std::set<uint64_t> *list) const {
+    std::unique_ptr<SequentialFileReader> file_reader, std::set<uint64_t> *list,
+    WALRecoveryMode recovery_mode) const {
   Status s;
   // create a callback that gets invoked whil looping through the log records
   VersionSet::LogReporter reporter;
@@ -93,7 +93,7 @@ IOStatus LocalManifestReader::GetLiveFilesFromFileReader(
                                         std::unordered_set<uint64_t>>>
       cf_live_files;
 
-  while (reader.ReadRecord(&record, &scratch) && s.ok()) {
+  while (reader.ReadRecord(&record, &scratch, recovery_mode) && s.ok()) {
     VersionEdit edit;
     s = edit.DecodeFrom(record);
     if (!s.ok()) {
@@ -152,7 +152,8 @@ ManifestReader::ManifestReader(std::shared_ptr<Logger> info_log,
 // cloud_manifest object
 //
 IOStatus ManifestReader::GetLiveFiles(const std::string &bucket_path,
-                                      std::set<uint64_t> *list) const {
+                                      std::set<uint64_t> *list,
+                                      WALRecoveryMode recovery_mode) const {
   IOStatus s;
   std::unique_ptr<CloudManifest> cloud_manifest;
   const FileOptions file_opts;
@@ -189,12 +190,14 @@ IOStatus ManifestReader::GetLiveFiles(const std::string &bucket_path,
     file_reader.reset(new SequentialFileReader(std::move(file), manifestFile));
   }
 
-  return GetLiveFilesFromFileReader(std::move(file_reader), list);
+  return GetLiveFilesFromFileReader(std::move(file_reader), list,
+                                    recovery_mode);
 }
 
 IOStatus ManifestReader::GetLiveFiles(const std::string &bucket_path,
                                       const std::string &epoch,
-                                      std::set<uint64_t> *list) const {
+                                      std::set<uint64_t> *list,
+                                      WALRecoveryMode recovery_mode) const {
   auto manifestFile = ManifestFileWithEpoch(bucket_path, epoch);
 
   IOStatus s;
@@ -213,12 +216,13 @@ IOStatus ManifestReader::GetLiveFiles(const std::string &bucket_path,
     file_reader.reset(new SequentialFileReader(std::move(file), manifestFile));
   }
 
-  return GetLiveFilesFromFileReader(std::move(file_reader), list);
+  return GetLiveFilesFromFileReader(std::move(file_reader), list,
+                                    recovery_mode);
 }
 
-IOStatus ManifestReader::GetMaxFileNumberFromManifest(FileSystem *fs,
-                                                      const std::string &fname,
-                                                      uint64_t *maxFileNumber) {
+IOStatus ManifestReader::GetMaxFileNumberFromManifest(
+    FileSystem *fs, const std::string &fname, uint64_t *maxFileNumber,
+    WALRecoveryMode recovery_mode) {
   // We check if the file exists to return IsNotFound() error status if it does
   // (NewSequentialFile) doesn't have the same behavior on file not existing --
   // it returns IOError instead.
@@ -245,7 +249,7 @@ IOStatus ManifestReader::GetMaxFileNumberFromManifest(FileSystem *fs,
   std::string scratch;
 
   *maxFileNumber = 0;
-  while (reader.ReadRecord(&record, &scratch) && s.ok()) {
+  while (reader.ReadRecord(&record, &scratch, recovery_mode) && s.ok()) {
     VersionEdit edit;
     s = status_to_io_status(edit.DecodeFrom(record));
     if (!s.ok()) {

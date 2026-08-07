@@ -92,6 +92,11 @@ DEFINE_uint64(dead_epoch_file_age_ms, 3600 * 1000,
               "Minimum S3 object age in milliseconds before a non-live file "
               "in a dead epoch (an epoch no CLOUDMANIFEST claims as current) "
               "is deleted (default: 3600000 ms = 1 hour)");
+DEFINE_bool(require_guard_marker, true,
+            "Abort the purge cycle when a live epoch has no "
+            "smallest_new_file_number marker. Disable only for a staged "
+            "rollout in which some writers do not yet publish the guard; "
+            "doing so allows deleting an in-flight upload.");
 DEFINE_uint64(max_deletions_per_cycle, 10000,
               "Maximum number of objects deleted per purge cycle; the "
               "remainder is re-selected next cycle. 0 means unlimited "
@@ -342,7 +347,8 @@ int main(int argc, char **argv) {
                                          FLAGS_dry_run,
                                          FLAGS_cloudmanifest_retention_ms,
                                          FLAGS_dead_epoch_file_age_ms,
-                                         FLAGS_max_deletions_per_cycle);
+                                         FLAGS_max_deletions_per_cycle,
+                                         FLAGS_require_guard_marker);
 
     if (!ROCKSDB_NAMESPACE::PrerequisitesMet(*cfs_impl)) {
       std::cerr << "Error: Prerequisites for purger not met" << std::endl;

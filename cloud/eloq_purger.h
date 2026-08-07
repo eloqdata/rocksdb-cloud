@@ -47,9 +47,13 @@ bool PrerequisitesMet(const CloudFileSystemImpl &cfs);
  */
 class S3FileNumberReader {
  public:
+  // When require_guard_marker is true, a missing marker is an error rather
+  // than a cue to fall back to the MANIFEST-derived high watermark. See
+  // ReadSmallestFileNumber.
   S3FileNumberReader(const std::string &bucket_name,
                      const std::string &s3_object_path,
-                     const std::string &epoch, CloudFileSystemImpl *cfs);
+                     const std::string &epoch, CloudFileSystemImpl *cfs,
+                     bool require_guard_marker = true);
 
   ~S3FileNumberReader() = default;
 
@@ -64,6 +68,7 @@ class S3FileNumberReader {
   std::string s3_object_path_;
   std::string epoch_;
   CloudFileSystemImpl *cfs_;
+  bool require_guard_marker_;
 
   std::string GetS3ObjectKey() const;
 };
@@ -100,7 +105,8 @@ class EloqPurger {
                  const std::string &object_path, bool dry_run,
                  uint64_t cloudmanifest_retention_ms = 3600 * 1000,
                  uint64_t dead_epoch_file_age_ms = 3600 * 1000,
-                 uint64_t max_deletions_per_cycle = 10000);
+                 uint64_t max_deletions_per_cycle = 10000,
+                 bool require_guard_marker = true);
 
   /**
    * @brief Run a single purge cycle with improved file number checking
@@ -117,7 +123,7 @@ class EloqPurger {
       const PurgerAllFiles &all_files,
       const PurgerEpochManifestMap &current_epoch_manifest_infos,
       uint64_t s3_current_time, std::vector<std::string> *obsolete_files);
-  void SelectObsoleteCloudManifestFiles(
+  Status SelectObsoleteCloudManifestFiles(
       const PurgerAllFiles &all_files,
       const PurgerCloudManifestMap &cloudmanifests,
       const PurgerEpochManifestMap &current_epoch_manifest_infos,
@@ -141,6 +147,13 @@ class EloqPurger {
   // Upper bound on deletions per cycle; the remainder is re-selected next
   // cycle. 0 means unlimited.
   uint64_t max_deletions_per_cycle_;
+  // Every writable DBCloud that shares a purged bucket must publish a
+  // smallest_new_file_number marker for its epoch (a 0 sentinel is written
+  // before recovery can flush). With this set, a missing marker for a live
+  // epoch means the protocol is not being honored -- an unguarded or
+  // out-of-date writer -- and the cycle aborts rather than falling back to a
+  // threshold that is unsafe for an active writer.
+  bool require_guard_marker_;
 
   Status ListAllFiles(PurgerAllFiles *all_files);
   Status ListCloudManifests(std::vector<std::string> *cloud_manifest_files);

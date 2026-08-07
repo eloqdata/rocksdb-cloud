@@ -157,13 +157,43 @@ uint64_t FileNumberSlidingWindow::SmallestFileNumber(Clock::time_point now) {
 
 // ---------------- FileNumberGuardPublisher ----------------
 
+namespace {
+
+std::vector<std::string> NormalizeDirectories(
+    std::vector<std::string> directories) {
+  for (auto &dir : directories) {
+    dir = rtrim_if(std::move(dir), '/');
+  }
+  return directories;
+}
+
+}  // namespace
+
 FileNumberGuardPublisher::FileNumberGuardPublisher(
     CloudFileSystemImpl *cfs, std::chrono::milliseconds publish_interval,
-    std::chrono::milliseconds entry_duration)
+    std::chrono::milliseconds entry_duration,
+    std::vector<std::string> db_directories)
     : cfs_(cfs),
       publish_interval_(publish_interval),
+      db_directories_(NormalizeDirectories(std::move(db_directories))),
       window_(entry_duration),
       scheduler_(CloudScheduler::Get()) {}
+
+bool FileNumberGuardPublisher::CoversFile(
+    const std::string &local_path) const {
+  if (db_directories_.empty()) {
+    // Unknown layout: gate everything rather than risk an unprotected
+    // upload.
+    return true;
+  }
+  const std::string dir = rtrim_if(dirname(local_path), '/');
+  for (const auto &db_dir : db_directories_) {
+    if (dir == db_dir) {
+      return true;
+    }
+  }
+  return false;
+}
 
 FileNumberGuardPublisher::~FileNumberGuardPublisher() { Stop(); }
 

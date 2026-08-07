@@ -58,16 +58,54 @@ bool HasReachedAge(uint64_t now, uint64_t mtime, uint64_t threshold) {
   return now > mtime && now - mtime >= threshold;
 }
 
+// Largest control object we will read. These objects hold a single decimal
+// uint64 (20 digits max); anything larger is malformed by definition and must
+// not be slurped into memory.
+constexpr size_t kMaxControlObjectBytes = 64;
+
+// Strict decimal uint64 parse for control objects that gate deletion.
+//
+// std::stoull is unusable here: it skips leading whitespace, accepts a sign
+// (so "-1" yields UINT64_MAX -- a threshold that authorizes deleting every
+// non-live SST of a live epoch), and ignores trailing garbage. Require a
+// non-empty run of ASCII digits, full consumption, and no overflow. A single
+// trailing newline is tolerated because writers commonly append one.
+bool ParseStrictUint64(const std::string &input, uint64_t *value) {
+  size_t end = input.size();
+  while (end > 0 && (input[end - 1] == '\n' || input[end - 1] == '\r')) {
+    --end;
+  }
+  if (end == 0 || end > 20) {
+    return false;
+  }
+  uint64_t parsed = 0;
+  for (size_t i = 0; i < end; ++i) {
+    const char c = input[i];
+    if (c < '0' || c > '9') {
+      return false;
+    }
+    const uint64_t digit = static_cast<uint64_t>(c - '0');
+    if (parsed > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+      return false;  // overflow
+    }
+    parsed = parsed * 10 + digit;
+  }
+  *value = parsed;
+  return true;
+}
+
 }  // namespace
 
 S3FileNumberReader::S3FileNumberReader(const std::string &bucket_name,
                                        const std::string &s3_object_path,
                                        const std::string &epoch,
-                                       CloudFileSystemImpl *cfs)
+                                       CloudFileSystemImpl *cfs,
+                                       bool require_guard_marker)
     : bucket_name_(bucket_name),
       s3_object_path_(s3_object_path),
       epoch_(epoch),
-      cfs_(cfs) {}
+      cfs_(cfs),
+      require_guard_marker_(require_guard_marker) {}
 
 Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
   std::string object_key = GetS3ObjectKey();
@@ -110,14 +148,29 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
       *file_number = std::numeric_limits<uint64_t>::min();
       return Status::IOError(s.ToString());
     }
-    // NotFound is safe only under the deployment contract that every writable
-    // DBCloud publishes this guard before uploading SSTs. Marker absence then
-    // identifies a snapshot/branch epoch with no active writer, so the maximum
-    // file number from its MANIFEST is a safe threshold.
+    if (require_guard_marker_) {
+      // The protocol requires every writable DBCloud on a purged bucket to
+      // publish this marker before it can upload an SST. Absence therefore
+      // means an unguarded or out-of-date writer may be running, and we
+      // cannot tell it apart from a writer-less epoch. Falling back to the
+      // MANIFEST high watermark here is what allows an in-flight compaction
+      // output to be deleted, so refuse instead.
+      Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+          "[pg] No file number guard marker for epoch %s (%s); aborting purge "
+          "cycle. Every writable DBCloud on this bucket must set "
+          "publish_file_number_guard.",
+          epoch_.c_str(), object_key.c_str());
+      *file_number = std::numeric_limits<uint64_t>::min();
+      return Status::NotFound("Missing file number guard marker", object_key);
+    }
+    // Legacy (staged-rollout) behavior: treat marker absence as a
+    // snapshot/branch epoch with no active writer and derive a threshold from
+    // its MANIFEST. Unsafe if an unguarded writer is in fact active.
     uint64_t manifest_max_file_number = 0;
     const std::string manifest_file_name = ManifestFileWithEpoch(epoch_);
     Status status = ManifestReader::GetMaxFileNumberFromManifest(
-        cfs_, manifest_file_name, &manifest_max_file_number);
+        cfs_, manifest_file_name, &manifest_max_file_number,
+        kManifestScanStrictMode);
     if (status.ok()) {
       if (manifest_max_file_number > 0) {
         manifest_max_file_number -= 1;
@@ -152,8 +205,12 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
     return Status::IOError("Failed to open temp file");
   }
 
-  std::string content((std::istreambuf_iterator<char>(temp_file)),
-                      std::istreambuf_iterator<char>());
+  // Bounded read: this object holds a single decimal uint64.
+  std::string content;
+  content.resize(kMaxControlObjectBytes + 1);
+  temp_file.read(&content[0], static_cast<std::streamsize>(content.size()));
+  content.resize(static_cast<size_t>(temp_file.gcount()));
+  const bool oversized = content.size() > kMaxControlObjectBytes;
 
   temp_file.close();
   // Remove the temp file
@@ -162,21 +219,26 @@ Status S3FileNumberReader::ReadSmallestFileNumber(uint64_t *file_number) {
         "Warning: Failed to remove temp file %s", temp_file_path.c_str());
   }
 
-  try {
-    *file_number = std::stoull(content);
-    Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
-        "Read smallest file number from S3: %llu, object_key: %s",
-        static_cast<unsigned long long>(*file_number), object_key.c_str());
-    return Status::OK();
-  } catch (const std::exception &e) {
+  uint64_t parsed = 0;
+  if (oversized || !ParseStrictUint64(content, &parsed)) {
+    // A malformed guard object cannot be interpreted safely: a permissive
+    // parse of "-1" would yield UINT64_MAX and authorize deleting every
+    // non-live SST of this epoch. Fail the cycle instead.
     Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
-        "Failed to parse smallest file number from S3 content: '%s', "
-        "returning UINT64_MIN",
-        content.c_str());
+        "[pg] Malformed smallest file number object %s (%zu bytes): '%s'; "
+        "aborting purge cycle",
+        object_key.c_str(), content.size(),
+        oversized ? "<oversized>" : content.c_str());
     *file_number = std::numeric_limits<uint64_t>::min();
-    return Status::Corruption("Failed to parse smallest file number: %s",
-                              e.what());
+    return Status::Corruption("Malformed smallest file number object",
+                              object_key);
   }
+
+  *file_number = parsed;
+  Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+      "Read smallest file number from S3: %llu, object_key: %s",
+      static_cast<unsigned long long>(*file_number), object_key.c_str());
+  return Status::OK();
 }
 
 std::string S3FileNumberReader::GetS3ObjectKey() const {
@@ -189,14 +251,16 @@ EloqPurger::EloqPurger(CloudFileSystemImpl *cfs, const std::string &bucket_name,
                        const std::string &object_path, bool dry_run,
                        uint64_t cloudmanifest_retention_ms,
                        uint64_t dead_epoch_file_age_ms,
-                       uint64_t max_deletions_per_cycle)
+                       uint64_t max_deletions_per_cycle,
+                       bool require_guard_marker)
     : cfs_(cfs),
       bucket_name_(bucket_name),
       object_path_(object_path),
       dry_run_(dry_run),
       cloudmanifest_retention_ms_(cloudmanifest_retention_ms),
       dead_epoch_file_age_ms_(dead_epoch_file_age_ms),
-      max_deletions_per_cycle_(max_deletions_per_cycle) {}
+      max_deletions_per_cycle_(max_deletions_per_cycle),
+      require_guard_marker_(require_guard_marker) {}
 
 bool EloqPurger::RunSinglePurgeCycle() {
   PurgerCycleState state;
@@ -268,11 +332,19 @@ bool EloqPurger::RunSinglePurgeCycle() {
                               state.current_epoch_manifest_files,
                               state.s3_current_time, &state.obsolete_files);
 
-  // Select obsolete CLOUDMANIFEST files
-  SelectObsoleteCloudManifestFiles(state.all_files, state.cloudmanifests,
-                                   state.current_epoch_manifest_files,
-                                   state.s3_current_time,
-                                   &state.obsolete_files);
+  // Select obsolete CLOUDMANIFEST files. A malformed CLOUDMANIFEST name
+  // aborts the cycle: we cannot reason about generational lineage from a name
+  // we cannot parse, and guessing risks retiring the authoritative one.
+  if (!SelectObsoleteCloudManifestFiles(
+           state.all_files, state.cloudmanifests,
+           state.current_epoch_manifest_files, state.s3_current_time,
+           &state.obsolete_files)
+           .ok()) {
+    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+        "[pg] Failed to select obsolete CLOUDMANIFEST files, aborting purge "
+        "cycle");
+    return false;
+  }
 
   // Select smallest_new_file_number markers of dead epochs
   SelectObsoleteFileNumberMarkers(state.all_files,
@@ -412,8 +484,12 @@ Status EloqPurger::CollectLiveFiles(
 
     (*current_epoch_manifest_infos)[current_epoch] = manifest_file_info;
 
+    // Absolute consistency: a tolerated corrupt tail would silently drop
+    // live-file additions from this set, and those files would then be
+    // selected for deletion.
     s = manifest_reader->GetLiveFiles(object_path_, current_epoch,
-                                      &live_file_numbers);
+                                      &live_file_numbers,
+                                      kManifestScanStrictMode);
     if (!s.ok()) {
       Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
           "[pg] Failed to get live files from cloud manifest file %s: %s",
@@ -444,7 +520,7 @@ Status EloqPurger::LoadFileNumberThresholds(
 
     // Create S3 file number updater to read threshold
     auto s3_updater = std::make_unique<S3FileNumberReader>(
-        bucket_name_, object_path_, epoch, cfs_);
+        bucket_name_, object_path_, epoch, cfs_, require_guard_marker_);
 
     uint64_t threshold;
     Status s = s3_updater->ReadSmallestFileNumber(&threshold);
@@ -681,7 +757,7 @@ Status EloqPurger::GetS3CurrentTime(uint64_t *current_time) {
   return Status::OK();
 }
 
-void EloqPurger::SelectObsoleteCloudManifestFiles(
+Status EloqPurger::SelectObsoleteCloudManifestFiles(
     const PurgerAllFiles &all_files,
     const PurgerCloudManifestMap &cloudmanifests,
     const PurgerEpochManifestMap &current_epoch_manifest_infos,
@@ -760,16 +836,19 @@ void EloqPurger::SelectObsoleteCloudManifestFiles(
       term_str = remainder.substr(last_dash + 1);
     }
 
-    // Validate that term is a number
+    // Validate that term is a number. A permissive parse is dangerous in
+    // both directions: "9999x" would read as 9999 and could make a bogus
+    // object the group's max term, retiring the authoritative CLOUDMANIFEST;
+    // silently skipping an unparseable name hides an object whose lineage we
+    // cannot reason about. Abort the cycle instead.
     uint64_t term = 0;
-    try {
-      term = std::stoull(term_str);
-    } catch (const std::exception &e) {
-      // Not a valid pattern, skip this file
-      Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
-          "[pg] Skipping CLOUDMANIFEST file %s (invalid term: %s)",
+    if (!ParseStrictUint64(term_str, &term)) {
+      Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+          "[pg] CLOUDMANIFEST file %s has a malformed term '%s'; aborting "
+          "purge cycle",
           candidate_file_path.c_str(), term_str.c_str());
-      continue;
+      return Status::Corruption("Malformed CLOUDMANIFEST term",
+                                candidate_file_path);
     }
 
     // Group by postfix
@@ -868,6 +947,7 @@ void EloqPurger::SelectObsoleteCloudManifestFiles(
       }
     }
   }
+  return Status::OK();
 }
 
 void EloqPurger::SelectObsoleteFileNumberMarkers(

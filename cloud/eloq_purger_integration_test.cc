@@ -48,6 +48,7 @@ int main() {
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -55,13 +56,19 @@ int main() {
 #include <aws/core/Aws.h>
 #include <aws/s3/S3Client.h>
 
+#include "cloud/cloud_manifest.h"
 #include "cloud/eloq_purger.h"
 #include "cloud/file_number_guard.h"
+#include "cloud/filename.h"
+#include "cloud/manifest_reader.h"
+#include "file/filename.h"
+#include "file/sequence_file_reader.h"
 #include "rocksdb/cloud/cloud_file_system.h"
 #include "rocksdb/cloud/cloud_file_system_impl.h"
 #include "rocksdb/cloud/db_cloud.h"
 #include "rocksdb/metadata.h"
 #include "rocksdb/options.h"
+#include "rocksdb/utilities/checkpoint.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/stderr_logger.h"
@@ -263,6 +270,13 @@ TEST_F(EloqPurgerIntegrationTest, PurgeEndToEnd) {
         "ELOQ_PURGER_TEST_SECRET_KEY to run this test");
     return;
   }
+
+  // Purging requires every writable DBCloud to publish the file number guard;
+  // without a marker the cycle now fails closed. Model the supported
+  // deployment.
+  guard_enabled_ = true;
+  guard_publish_interval_ = std::chrono::seconds(3);
+  guard_entry_duration_ = std::chrono::seconds(2);
 
   WriteOptions wopt;
   wopt.disableWAL = true;
@@ -533,6 +547,282 @@ TEST_F(EloqPurgerIntegrationTest, FileNumberGuardEndToEnd) {
   delete db;
   observe_session.cfs_impl->GetStorageProvider()->EmptyBucket(bucket_,
                                                               object_path_);
+}
+
+// RollNewBranch creates a frozen backup in the database's object path: it
+// copies the current MANIFEST into a new epoch and publishes a CLOUDMANIFEST
+// under the supplied branch cookie. The purger must include every such branch
+// when computing the union of live SSTs.
+TEST_F(EloqPurgerIntegrationTest, RolledBranchesProtectReferencedSsts) {
+  if (!Configured()) {
+    ROCKSDB_GTEST_SKIP(
+        "set ELOQ_PURGER_TEST_S3_ENDPOINT, ELOQ_PURGER_TEST_ACCESS_KEY, "
+        "ELOQ_PURGER_TEST_SECRET_KEY to run this test");
+    return;
+  }
+
+  guard_enabled_ = true;
+  guard_publish_interval_ = std::chrono::seconds(3);
+  guard_entry_duration_ = std::chrono::seconds(2);
+
+  CloudSession db_session;
+  ASSERT_OK(OpenSession(&db_session));
+  Options options;
+  options.env = db_session.env.get();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+
+  DBCloud *db = nullptr;
+  ASSERT_OK(
+      DBCloud::Open(options, local_dbpath_, "" /*persistent_cache*/, 0, &db));
+
+  WriteOptions wopt;
+  wopt.disableWAL = true;
+  auto key = [](int i) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), "backup-key-%04d", i);
+    return std::string(buf);
+  };
+  auto write_generation = [&](int generation) {
+    for (int i = 0; i < 200; ++i) {
+      ASSERT_OK(db->Put(wopt, key(i),
+                        "generation-" + std::to_string(generation)));
+      if ((i + 1) % 50 == 0) {
+        ASSERT_OK(db->Flush(FlushOptions()));
+      }
+    }
+    ASSERT_OK(db->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  };
+
+  // Read the CLOUDMANIFEST produced by RollNewBranch, scan its new-epoch
+  // MANIFEST, and map every live file number using that branch's epoch map.
+  auto read_branch_ssts = [&](const std::string &branch_cookie) {
+    const std::string cloud_manifest_name =
+        MakeCloudManifestFile(object_path_, branch_cookie);
+    std::unique_ptr<FSSequentialFile> cloud_manifest_file;
+    IOStatus status = db_session.cfs_impl->NewSequentialFileCloud(
+        bucket_, cloud_manifest_name, FileOptions(), &cloud_manifest_file,
+        nullptr /*dbg*/);
+    EXPECT_OK(status);
+    if (!status.ok()) {
+      return std::set<std::string>{};
+    }
+
+    std::unique_ptr<CloudManifest> branch_manifest;
+    status = CloudManifest::LoadFromLog(
+        std::make_unique<SequentialFileReader>(
+            std::move(cloud_manifest_file), cloud_manifest_name),
+        &branch_manifest);
+    EXPECT_OK(status);
+    if (!status.ok()) {
+      return std::set<std::string>{};
+    }
+
+    std::set<uint64_t> file_numbers;
+    ManifestReader reader(db_session.cfs_impl->info_log_, db_session.cfs_impl,
+                          bucket_);
+    status = reader.GetLiveFiles(object_path_, branch_manifest->GetCurrentEpoch(),
+                                 &file_numbers, kManifestScanStrictMode);
+    EXPECT_OK(status);
+    if (!status.ok()) {
+      return std::set<std::string>{};
+    }
+
+    std::set<std::string> result;
+    for (uint64_t number : file_numbers) {
+      result.insert(db_session.cfs_impl->RemapFilenameWithCloudManifest(
+          MakeTableFileName(number), branch_manifest.get()));
+    }
+    return result;
+  };
+
+  // Each backup has an independent postfix and term, matching the purger's
+  // CLOUDMANIFEST cookie grouping contract.
+  const std::string branch1_cookie = "backup-one-1";
+  const std::string branch2_cookie = "backup-two-1";
+
+  write_generation(1);
+  ASSERT_OK(db_session.cfs_impl->RollNewBranch(local_dbpath_, branch1_cookie));
+  const std::set<std::string> backup1_ssts =
+      read_branch_ssts(branch1_cookie);
+  ASSERT_FALSE(backup1_ssts.empty());
+
+  write_generation(2);
+  ASSERT_OK(db_session.cfs_impl->RollNewBranch(local_dbpath_, branch2_cookie));
+  const std::set<std::string> backup2_ssts =
+      read_branch_ssts(branch2_cookie);
+  ASSERT_FALSE(backup2_ssts.empty());
+
+  // Advance the primary again so each backup has a chance to be the sole
+  // remaining reference to one or more older SSTs.
+  write_generation(3);
+  std::vector<LiveFileMetaData> current_files;
+  db->GetLiveFilesMetaData(&current_files);
+  std::set<std::string> current_ssts;
+  for (const auto &file : current_files) {
+    current_ssts.insert(db_session.cfs_impl->RemapFilename(file.name.substr(1)));
+  }
+
+  std::set<std::string> all_backup_ssts = backup1_ssts;
+  all_backup_ssts.insert(backup2_ssts.begin(), backup2_ssts.end());
+  std::set<std::string> backup_only_ssts;
+  for (const auto &file : all_backup_ssts) {
+    if (current_ssts.count(file) == 0) {
+      backup_only_ssts.insert(file);
+    }
+  }
+  ASSERT_FALSE(backup_only_ssts.empty())
+      << "test did not create an SST referenced only by a backup";
+
+  auto provider = db_session.cfs_impl->GetStorageProvider();
+  for (const auto &file : all_backup_ssts) {
+    ASSERT_OK(provider->ExistsCloudObject(bucket_, object_path_ + "/" + file));
+  }
+
+  // Wait until no primary flush/compaction is protected by the guard. This
+  // makes every non-current SST eligible unless a branch references it.
+  const std::string epoch =
+      db_session.cfs_impl->GetCloudManifest()->GetCurrentEpoch();
+  const std::string max_marker =
+      std::to_string(std::numeric_limits<uint64_t>::max());
+  CloudSession purge_session;
+  ASSERT_OK(OpenSession(&purge_session));
+  for (int i = 0; i < 20 &&
+                  ReadGuardMarker(&purge_session, epoch) != max_marker;
+       ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  }
+  ASSERT_EQ(ReadGuardMarker(&purge_session, epoch), max_marker);
+
+  const size_t sst_count_before = CountSst(ListObjects(&purge_session));
+  // RollNewBranch creates no writer and therefore no guard marker. The legacy
+  // fallback is safe for these immutable branch epochs and is required for the
+  // cycle to proceed; the writable primary still has its published marker.
+  EloqPurger purger(purge_session.cfs_impl, bucket_, object_path_,
+                    false /*dry_run*/, 3600 * 1000 /*retention_ms*/,
+                    1 /*dead_epoch_file_age_ms*/, 100000 /*cap*/,
+                    false /*require_guard_marker*/);
+  ASSERT_TRUE(purger.RunSinglePurgeCycle());
+  const size_t sst_count_after = CountSst(ListObjects(&purge_session));
+  ASSERT_LT(sst_count_after, sst_count_before)
+      << "purge did not reclaim any unreferenced SSTs";
+
+  bool all_backup_ssts_survived = true;
+  for (const auto &file : all_backup_ssts) {
+    IOStatus exists =
+        provider->ExistsCloudObject(bucket_, object_path_ + "/" + file);
+    EXPECT_OK(exists) << "purger deleted backup-referenced SST " << file;
+    all_backup_ssts_survived = all_backup_ssts_survived && exists.ok();
+  }
+
+  // Verify the active database too, then clean up the unique object path even
+  // when an EXPECT above detects a missing branch SST.
+  std::string value;
+  for (int i = 0; i < 200; ++i) {
+    ASSERT_OK(db->Get(ReadOptions(), key(i), &value));
+    ASSERT_EQ(value, "generation-3");
+  }
+  delete db;
+  provider->EmptyBucket(bucket_, object_path_).PermitUncheckedError();
+  ASSERT_TRUE(all_backup_ssts_survived);
+}
+
+// Checkpoint copies SSTs through the cloud file system (LinkFile is
+// NotSupported for bucket-backed file systems, so CreateCheckpoint always
+// falls back to copying). Those copies land outside the DB directory and no
+// flush/compaction job registers them, so gating them would fail the
+// checkpoint outright.
+//
+// This test asserts only that the file number guard does not change
+// checkpoint behavior. It does NOT assert that checkpointing a cloud
+// database is useful: a cloud checkpoint currently contains no SST files at
+// all, with or without the guard, because the copies are treated as this
+// DB's own cloud SSTs -- uploaded to destname() (the DB's own object path)
+// and then deleted locally when keep_local_sst_files is false. That is
+// pre-existing behavior and out of scope here; EloqData creates backups and
+// branches through a separate path rather than the Checkpoint API.
+TEST_F(EloqPurgerIntegrationTest, GuardDoesNotAffectCheckpoint) {
+  if (!Configured()) {
+    ROCKSDB_GTEST_SKIP(
+        "set ELOQ_PURGER_TEST_S3_ENDPOINT, ELOQ_PURGER_TEST_ACCESS_KEY, "
+        "ELOQ_PURGER_TEST_SECRET_KEY to run this test");
+    return;
+  }
+
+  guard_publish_interval_ = std::chrono::seconds(3);
+  guard_entry_duration_ = std::chrono::seconds(2);
+
+  // Runs an identical write + checkpoint flow and reports the checkpoint's
+  // status and the names it produced, so the guard's effect can be isolated.
+  auto run_checkpoint = [&](bool guard_enabled, Status *status,
+                            std::vector<std::string> *children) {
+    guard_enabled_ = guard_enabled;
+    const std::string db_path =
+        local_dbpath_ + (guard_enabled ? "_guarded" : "_plain");
+    const std::string checkpoint_dir = db_path + "_checkpoint";
+
+    CloudSession session;
+    ASSERT_OK(OpenSession(&session));
+    Options options;
+    options.env = session.env.get();
+    options.create_if_missing = true;
+    options.disable_auto_compactions = true;
+
+    WriteOptions wopt;
+    wopt.disableWAL = true;
+
+    DBCloud *db = nullptr;
+    ASSERT_OK(DBCloud::Open(options, db_path, "" /*persistent_cache*/, 0, &db));
+    for (int i = 0; i < 20; i++) {
+      ASSERT_OK(db->Put(wopt, "ck" + std::to_string(i), "v"));
+    }
+    ASSERT_OK(db->Flush(FlushOptions()));
+
+    Checkpoint *checkpoint = nullptr;
+    ASSERT_OK(Checkpoint::Create(db, &checkpoint));
+    std::unique_ptr<Checkpoint> checkpoint_guard(checkpoint);
+    *status = checkpoint->CreateCheckpoint(checkpoint_dir);
+    children->clear();
+    if (status->ok()) {
+      std::vector<std::string> names;
+      Env::Default()->GetChildren(checkpoint_dir, &names).PermitUncheckedError();
+      // Compare file kinds, not exact names: MANIFEST names embed the epoch,
+      // which necessarily differs between two separate databases.
+      for (const auto &name : names) {
+        if (name == "." || name == "..") {
+          continue;
+        } else if (name.find(".sst") != std::string::npos) {
+          children->push_back("SST");
+        } else if (name.rfind("MANIFEST", 0) == 0) {
+          children->push_back("MANIFEST");
+        } else if (name.rfind("OPTIONS", 0) == 0) {
+          children->push_back("OPTIONS");
+        } else {
+          children->push_back(name);
+        }
+      }
+      std::sort(children->begin(), children->end());
+    }
+
+    delete db;
+    Env::Default()->DeleteDir(checkpoint_dir);
+    session.cfs_impl->GetStorageProvider()->EmptyBucket(bucket_, object_path_);
+  };
+
+  Status plain_status;
+  std::vector<std::string> plain_children;
+  run_checkpoint(false, &plain_status, &plain_children);
+
+  Status guarded_status;
+  std::vector<std::string> guarded_children;
+  run_checkpoint(true, &guarded_status, &guarded_children);
+
+  // The guard must not change checkpoint behavior. Before the DB-directory
+  // exemption the guarded run failed with "no live file number registration",
+  // because checkpoint copies are not registered by any flush/compaction job.
+  ASSERT_OK(guarded_status) << guarded_status.ToString();
+  ASSERT_EQ(guarded_status.ok(), plain_status.ok());
+  ASSERT_EQ(guarded_children, plain_children);
 }
 
 }  //  namespace ROCKSDB_NAMESPACE

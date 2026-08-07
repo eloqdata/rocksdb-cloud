@@ -37,6 +37,9 @@
 #include <vector>
 
 #include "cloud/cloud_manifest.h"
+#include "cloud/manifest_reader.h"
+#include "db/log_writer.h"
+#include "db/version_edit.h"
 #include "file/writable_file_writer.h"
 #include "rocksdb/cloud/cloud_file_system.h"
 #include "rocksdb/cloud/cloud_storage_provider.h"
@@ -102,6 +105,24 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
     object_contents_[path] = std::move(contents);
   }
 
+  void SetListAllStatus(IOStatus status) {
+    list_all_status_ = std::move(status);
+  }
+
+  void SetListPrefixStatus(IOStatus status) {
+    list_prefix_status_ = std::move(status);
+  }
+
+  void SetPutStatus(IOStatus status) { put_status_ = std::move(status); }
+
+  void SetClockMetadataStatus(IOStatus status) {
+    clock_metadata_status_ = std::move(status);
+  }
+
+  void SetMetadataStatus(const std::string &path, IOStatus status) {
+    metadata_statuses_[path] = std::move(status);
+  }
+
   const std::vector<std::string> &delete_attempts() const {
     return delete_attempts_;
   }
@@ -134,6 +155,9 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
   IOStatus ListCloudObjects(const std::string & /*bucket_name*/,
                             const std::string &object_path,
                             PurgerAllFiles *files) override {
+    if (!list_all_status_.ok()) {
+      return list_all_status_;
+    }
     object_path_ = object_path;
     *files = files_;
     return IOStatus::OK();
@@ -143,6 +167,9 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
       const std::string & /*bucket_name*/, const std::string & /*object_path*/,
       const std::string &object_prefix,
       std::vector<std::string> *paths) override {
+    if (!list_prefix_status_.ok()) {
+      return list_prefix_status_;
+    }
     for (const auto &file : files_) {
       if (file.first.compare(0, object_prefix.size(), object_prefix) == 0) {
         paths->push_back(file.first);
@@ -154,6 +181,9 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
   IOStatus PutCloudObject(const std::string & /*local_path*/,
                           const std::string & /*bucket_name*/,
                           const std::string &object_path) override {
+    if (!put_status_.ok()) {
+      return put_status_;
+    }
     clock_objects_.insert(object_path);
     return IOStatus::OK();
   }
@@ -167,11 +197,30 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
   IOStatus GetCloudObjectMetadata(const std::string & /*bucket_name*/,
                                   const std::string &object_path,
                                   CloudObjectInformation *info) override {
-    if (clock_objects_.find(object_path) == clock_objects_.end()) {
-      return IOStatus::NotFound();
+    auto status = metadata_statuses_.find(object_path);
+    if (status != metadata_statuses_.end()) {
+      return status->second;
     }
-    *info = MakeInfo(kNow);
-    return IOStatus::OK();
+    if (clock_objects_.find(object_path) != clock_objects_.end()) {
+      if (!clock_metadata_status_.ok()) {
+        return clock_metadata_status_;
+      }
+      *info = MakeInfo(kNow);
+      return IOStatus::OK();
+    }
+
+    const std::string prefix = object_path_ + "/";
+    const std::string relative_path =
+        object_path.compare(0, prefix.size(), prefix) == 0
+            ? object_path.substr(prefix.size())
+            : object_path;
+    for (const auto &file : files_) {
+      if (file.first == relative_path) {
+        *info = file.second;
+        return IOStatus::OK();
+      }
+    }
+    return IOStatus::NotFound(object_path);
   }
 
   IOStatus CreateBucket(const std::string &) override { return NotSupported(); }
@@ -196,9 +245,23 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
     return NotSupported();
   }
   IOStatus GetCloudObject(const std::string &, const std::string &object_path,
-                          const std::string &) override {
+                          const std::string &local_path) override {
     auto status = get_statuses_.find(object_path);
-    return status == get_statuses_.end() ? NotSupported() : status->second;
+    if (status != get_statuses_.end()) {
+      return status->second;
+    }
+    auto contents = object_contents_.find(object_path);
+    if (contents == object_contents_.end()) {
+      return NotSupported();
+    }
+    std::ofstream out(local_path, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+      return IOStatus::IOError(local_path);
+    }
+    out.write(contents->second.data(),
+              static_cast<std::streamsize>(contents->second.size()));
+    out.close();
+    return IOStatus::OK();
   }
   IOStatus PutCloudObjectMetadata(
       const std::string &, const std::string &,
@@ -216,6 +279,10 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
                        const FileOptions &,
                        std::unique_ptr<CloudStorageReadableFile> *result,
                        IODebugContext *) override {
+    auto status = get_statuses_.find(object_path);
+    if (status != get_statuses_.end()) {
+      return status->second;
+    }
     auto contents = object_contents_.find(object_path);
     if (contents == object_contents_.end()) {
       return IOStatus::NotFound(object_path);
@@ -233,9 +300,14 @@ class RecordingPurgerStorageProvider : public CloudStorageProvider {
   std::string object_path_;
   std::unordered_map<std::string, IOStatus> delete_statuses_;
   std::unordered_map<std::string, IOStatus> get_statuses_;
+  std::unordered_map<std::string, IOStatus> metadata_statuses_;
   std::unordered_map<std::string, std::string> object_contents_;
   std::unordered_set<std::string> clock_objects_;
   std::vector<std::string> delete_attempts_;
+  IOStatus list_all_status_;
+  IOStatus list_prefix_status_;
+  IOStatus put_status_;
+  IOStatus clock_metadata_status_;
 };
 
 class RecordingLogger : public Logger {
@@ -263,6 +335,91 @@ std::unique_ptr<CloudFileSystemImpl> MakeCloudFileSystem(
   opts.cloud_file_deletion_delay = std::nullopt;
   return std::make_unique<CloudFileSystemImpl>(opts, FileSystem::Default(),
                                                logger);
+}
+
+std::string ReadTestFileAndRemove(const std::string &path) {
+  std::ifstream in(path, std::ios::binary);
+  std::string contents((std::istreambuf_iterator<char>(in)),
+                       std::istreambuf_iterator<char>());
+  in.close();
+  EXPECT_EQ(std::remove(path.c_str()), 0);
+  return contents;
+}
+
+// Serialized CLOUDMANIFEST bytes. `epoch_transitions` uses the same exclusive
+// file-number boundaries as CloudManifest::AddEpoch, allowing cycle tests to
+// verify that live files from earlier epochs are remapped and preserved.
+std::string MakeCloudManifestContents(
+    const std::string &initial_epoch,
+    const std::vector<std::pair<uint64_t, std::string>> &epoch_transitions =
+        {}) {
+  std::unique_ptr<CloudManifest> manifest;
+  EXPECT_OK(CloudManifest::CreateForEmptyDatabase(initial_epoch, &manifest));
+  for (const auto &transition : epoch_transitions) {
+    EXPECT_TRUE(manifest->AddEpoch(transition.first, transition.second));
+  }
+  static uint64_t serial = 0;
+  const std::string path = test::TmpDir() + "/purger_test_cloud_manifest_" +
+                           std::to_string(Env::Default()->NowMicros()) + "_" +
+                           std::to_string(++serial);
+  std::unique_ptr<WritableFileWriter> writer;
+  EXPECT_OK(WritableFileWriter::Create(FileSystem::Default(), path,
+                                       FileOptions(), &writer, nullptr));
+  EXPECT_OK(manifest->WriteToLog(std::move(writer)));
+  return ReadTestFileAndRemove(path);
+}
+
+// Serialized RocksDB MANIFEST bytes containing one add record for every live
+// file number. The purger reads these exact bytes through CloudFileSystemImpl,
+// so cycle tests cover decoding and CloudManifest epoch remapping rather than
+// injecting a precomputed live-file set.
+std::string MakeManifestContents(const std::vector<uint64_t> &live_files) {
+  static uint64_t serial = 0;
+  const std::string path = test::TmpDir() + "/purger_test_manifest_" +
+                           std::to_string(Env::Default()->NowMicros()) + "_" +
+                           std::to_string(++serial);
+  std::unique_ptr<WritableFileWriter> writer;
+  EXPECT_OK(WritableFileWriter::Create(FileSystem::Default(), path,
+                                       FileOptions(), &writer, nullptr));
+  {
+    log::Writer log_writer(std::move(writer), 0, false);
+    for (uint64_t file_number : live_files) {
+      VersionEdit edit;
+      edit.AddFile(
+          0 /*level*/, file_number, 0 /*path_id*/, 1 /*file_size*/,
+          InternalKey("a", 1, kTypeValue), InternalKey("z", 1, kTypeValue),
+          1 /*smallest_seqno*/, 1 /*largest_seqno*/,
+          false /*marked_for_compaction*/, Temperature::kUnknown,
+          kInvalidBlobFileNumber, kUnknownOldestAncesterTime,
+          kUnknownFileCreationTime, file_number /*epoch_number*/,
+          kUnknownFileChecksum, kUnknownFileChecksumFuncName, kNullUniqueId64x2,
+          0 /*compensated_range_deletion_size*/, 0 /*tail_size*/,
+          true /*user_defined_timestamps_persisted*/);
+      std::string record;
+      EXPECT_TRUE(edit.EncodeTo(&record, 0 /*timestamp_size*/));
+      EXPECT_OK(log_writer.AddRecord(WriteOptions(), record));
+    }
+    EXPECT_OK(log_writer.file()->Sync(IOOptions(), false));
+  }
+  return ReadTestFileAndRemove(path);
+}
+
+std::shared_ptr<RecordingPurgerStorageProvider> MakeValidCycleProvider() {
+  auto provider = std::make_shared<RecordingPurgerStorageProvider>(
+      EloqPurger::PurgerAllFiles{
+          {"CLOUDMANIFEST-db-1", MakeInfo(kNow - 2 * kHourMs)},
+          {"MANIFEST-epochA", MakeInfo(kNow - 2 * kHourMs)},
+          {"000001.sst-epochA", MakeInfo(kNow - 2 * kHourMs)},
+          {"000002.sst-epochA", MakeInfo(kNow - 2 * kHourMs)},
+          {"smallest_new_file_number-epochA",
+           MakeInfo(kNow - 2 * kHourMs)},
+      });
+  provider->SetObjectContents("dbpath/CLOUDMANIFEST-db-1",
+                              MakeCloudManifestContents("epochA"));
+  provider->SetObjectContents("dbpath/MANIFEST-epochA",
+                              MakeManifestContents({1}));
+  provider->SetObjectContents("dbpath/smallest_new_file_number-epochA", "10");
+  return provider;
 }
 
 }  // namespace
@@ -582,6 +739,376 @@ TEST(EloqPurgerCycleTest, BulkDeleteFailureFailsCycle) {
   ASSERT_NE(logger->log().find(
                 "obsolete_selected=1 deleted=0 failed=1"),
             std::string::npos);
+}
+
+// Exhaust the decision boundary for a living epoch. This is the central safety
+// property of the guard protocol: being live dominates every other signal, and
+// an unreferenced file is eligible only when it is strictly below a nonzero
+// published watermark.
+TEST_F(EloqPurgerTest, LivingEpochSelectionSafetyMatrix) {
+  for (uint64_t threshold : {uint64_t{0}, uint64_t{1}, uint64_t{10}}) {
+    for (uint64_t file_number :
+         {uint64_t{1}, uint64_t{9}, uint64_t{10}, uint64_t{11}}) {
+      for (bool is_live : {false, true}) {
+        char name_buffer[64];
+        snprintf(name_buffer, sizeof(name_buffer), "%06llu.sst-epochA",
+                 static_cast<unsigned long long>(file_number));
+        const std::string name(name_buffer);
+        const EloqPurger::PurgerAllFiles all_files{
+            {name, MakeInfo(kNow - 10 * kHourMs)}};
+        EloqPurger::PurgerLiveFileSet live_files;
+        if (is_live) {
+          live_files.insert(name);
+        }
+
+        std::vector<std::string> obsolete;
+        purger_.SelectObsoleteSSTFilesWithThreshold(
+            all_files, live_files, {{"epochA", threshold}}, kNow, &obsolete);
+
+        const bool expected_delete =
+            !is_live && threshold != 0 && file_number < threshold;
+        SCOPED_TRACE(testing::Message()
+                     << "threshold=" << threshold
+                     << " file_number=" << file_number
+                     << " live=" << is_live);
+        ASSERT_EQ(!obsolete.empty(), expected_delete);
+        if (expected_delete) {
+          ASSERT_EQ(obsolete, std::vector<std::string>{name});
+        }
+      }
+    }
+  }
+}
+
+TEST_F(EloqPurgerTest, AgeGuardsUseInclusiveBoundaryAndRejectYoungerObjects) {
+  const uint64_t boundary = kNow - kHourMs;
+  const EloqPurger::PurgerAllFiles all_files{
+      {"000001.sst-epochDead", MakeInfo(boundary)},
+      {"000002.sst-epochDead", MakeInfo(boundary + 1)},
+      {"MANIFEST-epochDeadBoundary", MakeInfo(boundary)},
+      {"MANIFEST-epochDeadYoung", MakeInfo(boundary + 1)},
+      {"smallest_new_file_number-epochDeadBoundary", MakeInfo(boundary)},
+      {"smallest_new_file_number-epochDeadYoung", MakeInfo(boundary + 1)},
+  };
+
+  std::vector<std::string> obsolete;
+  purger_.SelectObsoleteSSTFilesWithThreshold(all_files, {}, {}, kNow,
+                                              &obsolete);
+  purger_.SelectObsoleteManifestFiles(all_files, {}, kNow, &obsolete);
+  purger_.SelectObsoleteFileNumberMarkers(all_files, {}, kNow, &obsolete);
+  ASSERT_EQ(obsolete,
+            std::vector<std::string>({"000001.sst-epochDead",
+                                      "MANIFEST-epochDeadBoundary",
+                                      "smallest_new_file_number-epochDeadBoundary"}));
+}
+
+// Full cycle over real serialized metadata. It simultaneously checks:
+//   * live files from both current and historical epochs survive;
+//   * current-epoch garbage below the guard is reclaimed;
+//   * an in-flight boundary file (number == guard) survives;
+//   * dead-epoch garbage obeys its age delay; and
+//   * current metadata and unrelated objects are never selected.
+TEST(EloqPurgerCycleTest, DeletesOnlyObjectsProvenUnreachable) {
+  auto provider = std::make_shared<RecordingPurgerStorageProvider>(
+      EloqPurger::PurgerAllFiles{
+          {"CLOUDMANIFEST-db-2", MakeInfo(kNow - 2 * kHourMs)},
+          {"MANIFEST-epochNew", MakeInfo(kNow - 2 * kHourMs)},
+          {"000050.sst-epochOld", MakeInfo(kNow - 10 * kHourMs)},
+          {"000060.sst-epochOld", MakeInfo(kNow - 10 * kHourMs)},
+          {"000150.sst-epochNew", MakeInfo(kNow - 10 * kHourMs)},
+          {"000130.sst-epochNew", MakeInfo(kNow - 10 * kHourMs)},
+          {"000140.sst-epochNew", MakeInfo(kNow - 10 * kHourMs)},
+          {"000007.sst-epochDead", MakeInfo(kNow - 2 * kHourMs)},
+          {"000008.sst-epochOpening", MakeInfo(kNow - kHourMs + 1)},
+          {"MANIFEST-epochDead", MakeInfo(kNow - 2 * kHourMs)},
+          {"smallest_new_file_number-epochNew",
+           MakeInfo(kNow - 2 * kHourMs)},
+          {"smallest_new_file_number-epochDead",
+           MakeInfo(kNow - 2 * kHourMs)},
+          {"OPTIONS-000001", MakeInfo(kNow - 10 * kHourMs)},
+      });
+  provider->SetObjectContents(
+      "dbpath/CLOUDMANIFEST-db-2",
+      MakeCloudManifestContents("epochOld", {{100, "epochNew"}}));
+  provider->SetObjectContents("dbpath/MANIFEST-epochNew",
+                              MakeManifestContents({50, 150}));
+  provider->SetObjectContents("dbpath/smallest_new_file_number-epochNew",
+                              "140");
+  auto cfs = MakeCloudFileSystem(provider);
+  EloqPurger purger(cfs.get(), "test-bucket", "dbpath", false /*dry_run*/,
+                    kHourMs, kHourMs, 10000);
+
+  ASSERT_TRUE(purger.RunSinglePurgeCycle());
+  ASSERT_EQ(provider->delete_attempts(),
+            std::vector<std::string>({
+                "dbpath/000060.sst-epochOld",
+                "dbpath/000130.sst-epochNew",
+                "dbpath/000007.sst-epochDead",
+                "dbpath/MANIFEST-epochDead",
+                "dbpath/smallest_new_file_number-epochDead",
+            }));
+}
+
+// Failover is deliberately two-phase. During the cycle that retires the old
+// CLOUDMANIFEST, its guard and MANIFEST are still loaded and must protect old
+// epoch files. Only a subsequent fresh cycle may classify that epoch as dead.
+TEST(EloqPurgerCycleTest, FailoverRetiresProtectionBeforeReclaimingOldEpoch) {
+  auto provider = std::make_shared<RecordingPurgerStorageProvider>(
+      EloqPurger::PurgerAllFiles{
+          {"CLOUDMANIFEST-db-1", MakeInfo(kNow - 10 * kHourMs)},
+          {"CLOUDMANIFEST-db-2", MakeInfo(kNow - 2 * kHourMs)},
+          {"MANIFEST-epochOld", MakeInfo(kNow - 10 * kHourMs)},
+          {"MANIFEST-epochNew", MakeInfo(kNow - 2 * kHourMs)},
+          {"000040.sst-epochOld", MakeInfo(kNow - 10 * kHourMs)},
+          {"000060.sst-epochOld", MakeInfo(kNow - 10 * kHourMs)},
+          {"smallest_new_file_number-epochOld",
+           MakeInfo(kNow - 10 * kHourMs)},
+          {"smallest_new_file_number-epochNew",
+           MakeInfo(kNow - 2 * kHourMs)},
+      });
+  provider->SetObjectContents("dbpath/CLOUDMANIFEST-db-1",
+                              MakeCloudManifestContents("epochOld"));
+  provider->SetObjectContents(
+      "dbpath/CLOUDMANIFEST-db-2",
+      MakeCloudManifestContents("epochOld", {{100, "epochNew"}}));
+  provider->SetObjectContents("dbpath/MANIFEST-epochOld",
+                              MakeManifestContents({40}));
+  provider->SetObjectContents("dbpath/MANIFEST-epochNew",
+                              MakeManifestContents({40}));
+  provider->SetObjectContents("dbpath/smallest_new_file_number-epochOld",
+                              "50");
+  provider->SetObjectContents("dbpath/smallest_new_file_number-epochNew",
+                              "100");
+  auto cfs = MakeCloudFileSystem(provider);
+  EloqPurger purger(cfs.get(), "test-bucket", "dbpath", false /*dry_run*/,
+                    kHourMs, kHourMs, 10000);
+
+  ASSERT_TRUE(purger.RunSinglePurgeCycle());
+  ASSERT_EQ(provider->delete_attempts(),
+            std::vector<std::string>{"dbpath/CLOUDMANIFEST-db-1"});
+
+  ASSERT_TRUE(purger.RunSinglePurgeCycle());
+  ASSERT_EQ(provider->delete_attempts(),
+            std::vector<std::string>({
+                "dbpath/CLOUDMANIFEST-db-1",
+                "dbpath/000060.sst-epochOld",
+                "dbpath/MANIFEST-epochOld",
+                "dbpath/smallest_new_file_number-epochOld",
+            }));
+}
+
+// Every observation required to prove unreachability happens before the first
+// delete. Inject failures at each phase and require the entire cycle to be
+// side-effect free.
+TEST(EloqPurgerCycleTest, EveryPreDeletionFailureFailsClosed) {
+  const std::vector<std::string> phases = {
+      "list all",          "list cloud manifests", "read cloud manifest",
+      "corrupt cloud manifest", "read guard",      "corrupt guard",
+      "manifest metadata", "read manifest",        "upload clock",
+      "clock metadata",
+  };
+
+  for (size_t i = 0; i < phases.size(); ++i) {
+    auto provider = MakeValidCycleProvider();
+    switch (i) {
+      case 0:
+        provider->SetListAllStatus(IOStatus::IOError("injected list failure"));
+        break;
+      case 1:
+        provider->SetListPrefixStatus(
+            IOStatus::IOError("injected prefix-list failure"));
+        break;
+      case 2:
+        provider->SetGetStatus("dbpath/CLOUDMANIFEST-db-1",
+                               IOStatus::IOError("injected CM read failure"));
+        break;
+      case 3:
+        provider->SetObjectContents("dbpath/CLOUDMANIFEST-db-1", "corrupt");
+        break;
+      case 4:
+        provider->SetGetStatus(
+            "dbpath/smallest_new_file_number-epochA",
+            IOStatus::IOError("injected guard read failure"));
+        break;
+      case 5:
+        provider->SetObjectContents(
+            "dbpath/smallest_new_file_number-epochA", "-1");
+        break;
+      case 6:
+        provider->SetMetadataStatus(
+            "dbpath/MANIFEST-epochA",
+            IOStatus::IOError("injected manifest metadata failure"));
+        break;
+      case 7:
+        provider->SetGetStatus(
+            "dbpath/MANIFEST-epochA",
+            IOStatus::IOError("injected manifest read failure"));
+        break;
+      case 8:
+        provider->SetPutStatus(IOStatus::IOError("injected clock put failure"));
+        break;
+      case 9:
+        provider->SetClockMetadataStatus(
+            IOStatus::IOError("injected clock metadata failure"));
+        break;
+    }
+
+    auto cfs = MakeCloudFileSystem(provider);
+    EloqPurger purger(cfs.get(), "test-bucket", "dbpath", false /*dry_run*/,
+                      kHourMs, kHourMs, 10000);
+    SCOPED_TRACE(phases[i]);
+    ASSERT_FALSE(purger.RunSinglePurgeCycle());
+    ASSERT_TRUE(provider->delete_attempts().empty());
+  }
+}
+
+TEST(EloqPurgerCycleTest, DryRunExecutesProofButNeverDeletes) {
+  auto provider = MakeValidCycleProvider();
+  auto cfs = MakeCloudFileSystem(provider);
+  EloqPurger purger(cfs.get(), "test-bucket", "dbpath", true /*dry_run*/,
+                    kHourMs, kHourMs, 10000);
+
+  ASSERT_TRUE(purger.RunSinglePurgeCycle());
+  ASSERT_TRUE(provider->delete_attempts().empty());
+}
+
+// ---- Strict parsing of numeric control objects (guard marker) ----
+
+// std::stoull would accept all of these; a permissive parse of "-1" yields
+// UINT64_MAX, a threshold that authorizes deleting every non-live SST of a
+// live epoch.
+TEST(EloqPurgerGuardParseTest, RejectsMalformedMarkerContents) {
+  const std::string key = "dbpath/smallest_new_file_number-epochA";
+  for (const std::string &bad :
+       {std::string("-1"), std::string("+1"), std::string(" 1"),
+        std::string("1 "), std::string("12abc"), std::string("0x10"),
+        std::string(""), std::string("\n"), std::string("1.5"),
+        std::string("99999999999999999999999"),
+        std::string(70, '7') /* oversized object */}) {
+    auto provider = std::make_shared<RecordingPurgerStorageProvider>(
+        EloqPurger::PurgerAllFiles{});
+    provider->SetObjectContents(key, bad);
+    auto cfs = MakeCloudFileSystem(provider);
+    S3FileNumberReader reader("test-bucket", "dbpath", "epochA", cfs.get());
+
+    uint64_t threshold = 12345;
+    Status s = reader.ReadSmallestFileNumber(&threshold);
+    ASSERT_TRUE(s.IsCorruption()) << "input '" << bad << "' -> " << s.ToString();
+    ASSERT_EQ(threshold, std::numeric_limits<uint64_t>::min());
+  }
+}
+
+TEST(EloqPurgerGuardParseTest, AcceptsWellFormedMarkerContents) {
+  const std::string key = "dbpath/smallest_new_file_number-epochA";
+  const std::vector<std::pair<std::string, uint64_t>> cases = {
+      {"0", 0},
+      {"123", 123},
+      {"123\n", 123},
+      {"123\r\n", 123},
+      {"18446744073709551615", std::numeric_limits<uint64_t>::max()},
+  };
+  for (const auto &[content, expected] : cases) {
+    auto provider = std::make_shared<RecordingPurgerStorageProvider>(
+        EloqPurger::PurgerAllFiles{});
+    provider->SetObjectContents(key, content);
+    auto cfs = MakeCloudFileSystem(provider);
+    S3FileNumberReader reader("test-bucket", "dbpath", "epochA", cfs.get());
+
+    uint64_t threshold = 0;
+    ASSERT_OK(reader.ReadSmallestFileNumber(&threshold)) << content;
+    ASSERT_EQ(threshold, expected) << content;
+  }
+}
+
+// ---- Missing marker must fail closed ----
+
+TEST(EloqPurgerCycleTest, MissingGuardMarkerAbortsCycle) {
+  const std::string cloud_manifest_name = "CLOUDMANIFEST-db-1";
+  auto provider = std::make_shared<RecordingPurgerStorageProvider>(
+      EloqPurger::PurgerAllFiles{
+          {cloud_manifest_name, MakeInfo(kNow - 2 * kHourMs)},
+          {"000001.sst-epochA", MakeInfo(kNow - 2 * kHourMs)}});
+  provider->SetObjectContents("dbpath/" + cloud_manifest_name,
+                              MakeCloudManifestContents("epochA"));
+  // No smallest_new_file_number-epochA object at all.
+  provider->SetGetStatus("dbpath/smallest_new_file_number-epochA",
+                         IOStatus::NotFound());
+  auto cfs = MakeCloudFileSystem(provider);
+
+  EloqPurger purger(cfs.get(), "test-bucket", "dbpath", false /*dry_run*/,
+                    kHourMs, kHourMs, 10000, true /*require_guard_marker*/);
+  ASSERT_FALSE(purger.RunSinglePurgeCycle());
+  ASSERT_TRUE(provider->delete_attempts().empty());
+}
+
+// ---- Malformed CLOUDMANIFEST term must fail closed ----
+
+// A permissive parse of "1x" reads as 1; a bogus high term could make the
+// authoritative CLOUDMANIFEST look superseded.
+TEST(EloqPurgerCycleTest, MalformedCloudManifestTermAbortsCycle) {
+  const std::string bad_name = "CLOUDMANIFEST-db-1x";
+  auto provider = std::make_shared<RecordingPurgerStorageProvider>(
+      EloqPurger::PurgerAllFiles{{bad_name, MakeInfo(kNow - 2 * kHourMs)},
+                                 {"MANIFEST-epochA",
+                                  MakeInfo(kNow - 2 * kHourMs)},
+                                 {"000001.sst-epochDead",
+                                  MakeInfo(kNow - 2 * kHourMs)}});
+  provider->SetObjectContents("dbpath/" + bad_name,
+                              MakeCloudManifestContents("epochA"));
+  provider->SetObjectContents("dbpath/MANIFEST-epochA",
+                              MakeManifestContents({}));
+  provider->SetObjectContents("dbpath/smallest_new_file_number-epochA", "5");
+  auto cfs = MakeCloudFileSystem(provider);
+
+  EloqPurger purger(cfs.get(), "test-bucket", "dbpath", false /*dry_run*/,
+                    kHourMs, kHourMs, 10000);
+  ASSERT_FALSE(purger.RunSinglePurgeCycle());
+  ASSERT_TRUE(provider->delete_attempts().empty());
+}
+
+// ---- MANIFEST corruption must fail closed for the purger ----
+
+// A torn tail is tolerated by the DB-open reader (so recovery can proceed)
+// but must be an error for a scanner that deletes data: a skipped tail
+// containing a file addition would make a live SST look unreferenced.
+TEST(EloqPurgerManifestScanTest, StrictModeRejectsTornManifestTail) {
+  const std::string path = test::TmpDir() + "/purger_torn_manifest_" +
+                           std::to_string(Env::Default()->NowMicros());
+  {
+    std::unique_ptr<WritableFileWriter> writer;
+    ASSERT_OK(WritableFileWriter::Create(FileSystem::Default(), path,
+                                         FileOptions(), &writer, nullptr));
+    log::Writer log_writer(std::move(writer), 0, false);
+    VersionEdit edit;
+    edit.SetNextFile(42);
+    std::string record;
+    ASSERT_TRUE(edit.EncodeTo(&record));
+    ASSERT_OK(log_writer.AddRecord(WriteOptions(), record));
+    ASSERT_OK(log_writer.file()->Sync(IOOptions(), false));
+  }
+  // Append a torn record: a partial header is exactly what a truncated
+  // upload or a corrupted tail looks like.
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    const std::string garbage(5, '\xab');
+    out.write(garbage.data(), static_cast<std::streamsize>(garbage.size()));
+  }
+
+  uint64_t max_file_number = 0;
+  // DB-open behavior: tolerate the tail so recovery can proceed.
+  ASSERT_OK(ManifestReader::GetMaxFileNumberFromManifest(
+      FileSystem::Default().get(), path, &max_file_number,
+      kManifestScanDefaultMode));
+  ASSERT_EQ(max_file_number, 42u);
+
+  // Purger behavior: refuse.
+  max_file_number = 0;
+  Status strict = ManifestReader::GetMaxFileNumberFromManifest(
+      FileSystem::Default().get(), path, &max_file_number,
+      kManifestScanStrictMode);
+  ASSERT_FALSE(strict.ok()) << strict.ToString();
+
+  ASSERT_EQ(std::remove(path.c_str()), 0);
 }
 
 }  //  namespace ROCKSDB_NAMESPACE

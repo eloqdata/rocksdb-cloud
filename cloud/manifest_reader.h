@@ -7,8 +7,21 @@
 #include <string>
 
 #include "rocksdb/io_status.h"
+#include "rocksdb/options.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// Recovery mode for MANIFEST scans.
+//
+// kTolerateCorruptedTailRecords is right for DB open: a torn tail record is
+// skipped so recovery can proceed. It is WRONG for a destructive scanner --
+// a skipped tail containing a file addition makes a live SST look
+// unreferenced, and the purger would delete it. Callers that delete data
+// must pass kAbsoluteConsistency so any corruption surfaces as an error.
+constexpr WALRecoveryMode kManifestScanDefaultMode =
+    WALRecoveryMode::kTolerateCorruptedTailRecords;
+constexpr WALRecoveryMode kManifestScanStrictMode =
+    WALRecoveryMode::kAbsoluteConsistency;
 
 class CloudFileSystem;
 class FileSystem;
@@ -43,7 +56,8 @@ class LocalManifestReader {
   // file_reader
   IOStatus GetLiveFilesFromFileReader(
       std::unique_ptr<SequentialFileReader> file_reader,
-      std::set<uint64_t>* list) const;
+      std::set<uint64_t>* list,
+      WALRecoveryMode recovery_mode = kManifestScanDefaultMode) const;
 
   std::shared_ptr<Logger> info_log_;
   CloudFileSystem* cfs_;
@@ -61,16 +75,18 @@ class ManifestReader : public LocalManifestReader {
   // It will read from CLOUDMANIFEST and MANIFEST file in s3 directly
   // TODO(wei): remove this function. Reading from s3 directly is very slow for
   // large MANIFEST file
-  IOStatus GetLiveFiles(const std::string& bucket_path,
-                        std::set<uint64_t>* list) const;
+  IOStatus GetLiveFiles(
+      const std::string& bucket_path, std::set<uint64_t>* list,
+      WALRecoveryMode recovery_mode = kManifestScanDefaultMode) const;
 
-  IOStatus GetLiveFiles(const std::string& bucket_path,
-                        const std::string& epoch,
-                        std::set<uint64_t>* list) const;
+  IOStatus GetLiveFiles(
+      const std::string& bucket_path, const std::string& epoch,
+      std::set<uint64_t>* list,
+      WALRecoveryMode recovery_mode = kManifestScanDefaultMode) const;
 
-  static IOStatus GetMaxFileNumberFromManifest(FileSystem* fs,
-                                               const std::string& fname,
-                                               uint64_t* maxFileNumber);
+  static IOStatus GetMaxFileNumberFromManifest(
+      FileSystem* fs, const std::string& fname, uint64_t* maxFileNumber,
+      WALRecoveryMode recovery_mode = kManifestScanDefaultMode);
 
  private:
   std::string bucket_prefix_;

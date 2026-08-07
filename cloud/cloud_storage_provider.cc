@@ -179,6 +179,17 @@ IOStatus CloudStorageWritableFileImpl::Close(const IOOptions& opts,
     auto* cfs_impl = dynamic_cast<CloudFileSystemImpl*>(cfs_);
     auto publisher =
         cfs_impl == nullptr ? nullptr : cfs_impl->GetFileNumberGuardPublisher();
+    if (publisher && !publisher->CoversFile(fname_)) {
+      // Written outside the DB's own SST directories (a checkpoint copy, a
+      // column family export): not a DB-visible SST. No flush/compaction job
+      // registers it and the purger never evaluates it as this DB's live or
+      // obsolete file, so the guard neither protects nor blocks it.
+      Log(InfoLogLevel::DEBUG_LEVEL, cfs_->GetLogger(),
+          "[%s] CloudWritableFile %s is outside the DB directories; skipping "
+          "file number guard",
+          Name(), fname_.c_str());
+      publisher.reset();
+    }
     uint64_t file_number = 0;
     FileType file_type;
     const std::string logical_name = basename(RemoveEpoch(fname_));
