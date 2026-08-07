@@ -1901,6 +1901,15 @@ cloud_manifest_test: cloud/cloud_manifest_test.o $(TEST_LIBRARY) $(LIBRARY)
 cloud_scheduler_test: cloud/cloud_scheduler_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+eloq_purger_test: cloud/eloq_purger_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+file_number_guard_test: cloud/file_number_guard_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+eloq_purger_integration_test: cloud/eloq_purger_integration_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 iostats_context_test: $(OBJ_DIR)/monitoring/iostats_context_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_V_CCLD)$(CXX) $^ $(EXEC_LDFLAGS) -o $@ $(LDFLAGS)
 

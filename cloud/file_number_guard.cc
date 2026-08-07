@@ -1,0 +1,655 @@
+/**
+ *    Copyright (C) 2025 EloqData Inc.
+ *
+ *    This program is free software: you can redistribute it and/or  modify
+ *    it under either of the following two licenses:
+ *    1. GNU Affero General Public License, version 3, as published by the Free
+ *    Software Foundation.
+ *    2. GNU General Public License as published by the Free Software
+ *    Foundation; version 2 of the License.
+ *
+ *    This program is distributed in the hope that it will be useful,
+ *    but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *    GNU Affero General Public License or GNU General Public License for more
+ *    details.
+ *
+ *    You should have received a copy of the GNU Affero General Public License
+ *    and GNU General Public License V2 along with this program.  If not, see
+ *    <http://www.gnu.org/licenses/>.
+ *
+ */
+
+#include "cloud/file_number_guard.h"
+
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <sstream>
+
+#include "cloud/cloud_manifest.h"
+#include "cloud/cloud_scheduler.h"
+#include "cloud/filename.h"
+#include "file/filename.h"
+#include "rocksdb/cloud/cloud_file_system_impl.h"
+#include "rocksdb/cloud/cloud_storage_provider.h"
+#include "rocksdb/db.h"
+#include "rocksdb/env.h"
+#include "test_util/sync_point.h"
+
+namespace ROCKSDB_NAMESPACE {
+
+std::string SmallestFileNumberObjectKey(const std::string &object_path,
+                                        const std::string &epoch) {
+  std::ostringstream oss;
+  oss << object_path;
+  if (!object_path.empty() && object_path.back() != '/') {
+    oss << "/";
+  }
+  oss << kSmallestFileNumberFilePrefix << epoch;
+  return oss.str();
+}
+
+// One-shot PUT of the guard object. Shared by the publisher and by
+// CloudFileSystemImpl::BlockPurger when no publisher is registered. Callers
+// that care about PUT ordering must serialize calls themselves (the
+// publisher's publish_mutex_ does this).
+IOStatus PutSmallestFileNumberObject(CloudFileSystemImpl *cfs, uint64_t value,
+                                     const std::string &epoch) {
+  if (epoch.empty()) {
+    // Publishing to "smallest_new_file_number-" (empty epoch) would create a
+    // malformed guard object no reader ever consults. Should be impossible
+    // now that the epoch is sourced from the cloud manifest, but keep the
+    // guard.
+    Log(InfoLogLevel::ERROR_LEVEL, cfs->info_log_,
+        "[fng] Refusing to publish smallest file number: epoch is empty");
+    return IOStatus::InvalidArgument("empty epoch for file number guard");
+  }
+
+  std::string content = std::to_string(value);
+  std::string object_key =
+      SmallestFileNumberObjectKey(cfs->GetDestObjectPath(), epoch);
+
+  char tmp_template[] = "/tmp/smallest_file_number_upload_XXXXXX";
+  int fd = mkstemp(tmp_template);
+  if (fd == -1) {
+    Log(InfoLogLevel::ERROR_LEVEL, cfs->info_log_,
+        "[fng] Failed to create temp file for publishing smallest file "
+        "number: %s",
+        strerror(errno));
+    return IOStatus::IOError("Failed to create temp file");
+  }
+  std::string temp_file_path = tmp_template;
+  if (fchmod(fd, S_IRUSR | S_IWUSR) != 0) {
+    Log(InfoLogLevel::WARN_LEVEL, cfs->info_log_,
+        "[fng] Failed to set restricted permissions on temp file: %s",
+        strerror(errno));
+  }
+  ssize_t written = write(fd, content.c_str(), content.size());
+  close(fd);
+  if (written < 0 || static_cast<size_t>(written) != content.size()) {
+    Log(InfoLogLevel::ERROR_LEVEL, cfs->info_log_,
+        "[fng] Failed to write temp file %s: %s", temp_file_path.c_str(),
+        strerror(errno));
+    std::remove(temp_file_path.c_str());
+    return IOStatus::IOError("Failed to write temp file");
+  }
+
+  IOStatus st = cfs->GetStorageProvider()->PutCloudObject(
+      temp_file_path, cfs->GetDestBucketName(), object_key);
+  TEST_SYNC_POINT_CALLBACK(
+      "FileNumberGuard::PutSmallestFileNumberObject:Status", &st);
+
+  if (std::remove(temp_file_path.c_str()) != 0) {
+    Log(InfoLogLevel::WARN_LEVEL, cfs->info_log_,
+        "[fng] Failed to remove temp file %s", temp_file_path.c_str());
+  }
+
+  if (st.ok()) {
+    Log(InfoLogLevel::INFO_LEVEL, cfs->info_log_,
+        "[fng] Published smallest file number %llu for epoch %s (%s)",
+        static_cast<unsigned long long>(value), epoch.c_str(),
+        object_key.c_str());
+  } else {
+    Log(InfoLogLevel::ERROR_LEVEL, cfs->info_log_,
+        "[fng] Failed to publish smallest file number %llu for epoch %s: %s",
+        static_cast<unsigned long long>(value), epoch.c_str(),
+        st.ToString().c_str());
+  }
+  return st;
+}
+
+// ---------------- FileNumberSlidingWindow ----------------
+
+void FileNumberSlidingWindow::Add(uint64_t file_number, uint64_t thread_id,
+                                  int job_id) {
+  // emplace keeps an existing entry: for multi-CF jobs firing several begin
+  // events, the earliest (smallest, hence safest) snapshot wins.
+  entries_.emplace(std::make_pair(thread_id, job_id), Entry{file_number, {}});
+}
+
+void FileNumberSlidingWindow::MarkRemoved(uint64_t thread_id, int job_id,
+                                          Clock::time_point now) {
+  auto it = entries_.find(std::make_pair(thread_id, job_id));
+  if (it != entries_.end()) {
+    it->second.removed = true;
+    it->second.removed_at = now;
+  }
+}
+
+uint64_t FileNumberSlidingWindow::SmallestFileNumber(Clock::time_point now) {
+  uint64_t smallest = std::numeric_limits<uint64_t>::max();
+  for (auto it = entries_.begin(); it != entries_.end();) {
+    if (it->second.removed && now - it->second.removed_at >= entry_duration_) {
+      it = entries_.erase(it);
+      continue;
+    }
+    if (it->second.file_number < smallest) {
+      smallest = it->second.file_number;
+    }
+    ++it;
+  }
+  return smallest;
+}
+
+// ---------------- FileNumberGuardPublisher ----------------
+
+namespace {
+
+std::vector<std::string> NormalizeDirectories(
+    std::vector<std::string> directories) {
+  for (auto &dir : directories) {
+    dir = rtrim_if(std::move(dir), '/');
+  }
+  return directories;
+}
+
+}  // namespace
+
+FileNumberGuardPublisher::FileNumberGuardPublisher(
+    CloudFileSystemImpl *cfs, std::chrono::milliseconds publish_interval,
+    std::chrono::milliseconds entry_duration,
+    std::vector<std::string> db_directories)
+    : cfs_(cfs),
+      publish_interval_(publish_interval),
+      db_directories_(NormalizeDirectories(std::move(db_directories))),
+      window_(entry_duration),
+      scheduler_(CloudScheduler::Get()) {}
+
+bool FileNumberGuardPublisher::CoversFile(
+    const std::string &local_path) const {
+  if (db_directories_.empty()) {
+    // Unknown layout: gate everything rather than risk an unprotected
+    // upload.
+    return true;
+  }
+  const std::string dir = rtrim_if(dirname(local_path), '/');
+  for (const auto &db_dir : db_directories_) {
+    if (dir == db_dir) {
+      return true;
+    }
+  }
+  return false;
+}
+
+FileNumberGuardPublisher::~FileNumberGuardPublisher() { Stop(); }
+
+void FileNumberGuardPublisher::Start() {
+  std::lock_guard<std::mutex> lk(stop_mutex_);
+  if (stopped_ || job_handle_ >= 0) {
+    return;
+  }
+  auto interval = std::chrono::duration_cast<std::chrono::microseconds>(
+      publish_interval_);
+  job_handle_ = scheduler_->ScheduleRecurringJob(
+      interval, interval, [this](void *) { PeriodicPublish(); }, nullptr);
+}
+
+void FileNumberGuardPublisher::Stop() {
+  long handle = -1;
+  bool notify = false;
+  {
+    std::lock_guard<std::mutex> lk(stop_mutex_);
+    if (!stopped_) {
+      stopped_ = true;
+      notify = true;
+      handle = job_handle_;
+      job_handle_ = -1;
+    }
+  }
+  if (notify) {
+    TEST_SYNC_POINT("FileNumberGuardPublisher::Stop:Stopped");
+    stop_cv_.notify_all();
+  }
+  if (handle >= 0) {
+    // Waits for a currently running periodic callback to finish, so after
+    // this returns no callback can touch this object.
+    scheduler_->CancelJob(handle);
+  }
+
+  // ProtectFileUpload holds this gate across both guard publication and the
+  // SST upload. Since stopped_ was set first, a protection that has not yet
+  // crossed its final stopped_ check cannot start an upload; one that has
+  // crossed it completes before this lock is acquired.
+  std::lock_guard<std::mutex> publish_lk(publish_mutex_);
+}
+
+std::string FileNumberGuardPublisher::CurrentEpoch() const {
+  auto *manifest = cfs_->GetCloudManifest();
+  if (manifest == nullptr) {
+    return "";
+  }
+  return manifest->GetCurrentEpoch();
+}
+
+Status FileNumberGuardPublisher::PutValue(uint64_t value,
+                                          const std::string &epoch) {
+  return PutSmallestFileNumberObject(cfs_, value, epoch);
+}
+
+void FileNumberGuardPublisher::OnJobBegin(uint64_t file_number,
+                                          uint64_t thread_id, int job_id) {
+  std::lock_guard<std::mutex> lk(state_mutex_);
+  window_.Add(file_number, thread_id, job_id);
+}
+
+Status FileNumberGuardPublisher::ProtectFileUpload(
+    uint64_t file_number, const std::function<Status()> &upload) {
+  {
+    std::lock_guard<std::mutex> lk(stop_mutex_);
+    if (stopped_) {
+      return Status::ShutdownInProgress("file number guard stopped");
+    }
+  }
+
+  std::lock_guard<std::mutex> publish_lk(publish_mutex_);
+  {
+    std::lock_guard<std::mutex> lk(stop_mutex_);
+    if (stopped_) {
+      return Status::ShutdownInProgress("file number guard stopped");
+    }
+  }
+
+  uint64_t desired;
+  bool needs_publish;
+  {
+    std::lock_guard<std::mutex> lk(state_mutex_);
+    desired = window_.SmallestFileNumber();
+    if (desired == std::numeric_limits<uint64_t>::max()) {
+      return Status::InvalidArgument("no live file number registration");
+    }
+    if (desired > file_number) {
+      return Status::InvalidArgument(
+          "live file number minimum exceeds SST file number");
+    }
+    needs_publish =
+        !sentinel_active_ && (remote_unknown_ || desired < last_published_);
+  }
+
+  if (needs_publish) {
+    std::string epoch = CurrentEpoch();
+    if (epoch.empty()) {
+      Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+          "[fng] Cannot protect SST %llu: epoch unavailable",
+          static_cast<unsigned long long>(file_number));
+      return Status::InvalidArgument("empty epoch for file number guard");
+    }
+
+    Status st;
+    auto backoff = std::chrono::milliseconds(100);
+    const auto max_backoff = std::chrono::milliseconds(2000);
+    while (true) {
+      {
+        std::lock_guard<std::mutex> lk(stop_mutex_);
+        if (stopped_) {
+          return Status::ShutdownInProgress("file number guard stopped");
+        }
+      }
+      st = PutValue(desired, epoch);
+      if (st.ok()) {
+        std::lock_guard<std::mutex> lk(state_mutex_);
+        last_published_ = desired;
+        sentinel_active_ = false;
+        remote_unknown_ = false;
+        break;
+      }
+      MarkRemoteUnknown();
+      Log(InfoLogLevel::WARN_LEVEL, cfs_->info_log_,
+          "[fng] Downward publish of %llu for SST %llu failed (%s); retrying "
+          "in %lld ms",
+          static_cast<unsigned long long>(desired),
+          static_cast<unsigned long long>(file_number), st.ToString().c_str(),
+          static_cast<long long>(backoff.count()));
+      std::unique_lock<std::mutex> lk(stop_mutex_);
+      if (stop_cv_.wait_for(lk, backoff, [this] { return stopped_; })) {
+        return Status::ShutdownInProgress("file number guard stopped");
+      }
+      backoff = std::min(backoff * 2, max_backoff);
+    }
+  }
+
+  {
+    // This check is the upload/Stop linearization point. publish_mutex_ stays
+    // held through upload, so Stop either sets stopped_ before this check or
+    // waits for the callback to finish.
+    std::lock_guard<std::mutex> lk(stop_mutex_);
+    if (stopped_) {
+      return Status::ShutdownInProgress("file number guard stopped");
+    }
+  }
+  if (upload) {
+    return upload();
+  }
+  return Status::OK();
+}
+
+void FileNumberGuardPublisher::OnJobEnd(uint64_t thread_id, int job_id) {
+  std::lock_guard<std::mutex> lk(state_mutex_);
+  window_.MarkRemoved(thread_id, job_id);
+}
+
+Status FileNumberGuardPublisher::BlockPurger() {
+  std::string epoch = CurrentEpoch();
+  if (epoch.empty()) {
+    Log(InfoLogLevel::ERROR_LEVEL, cfs_->info_log_,
+        "[fng] Cannot block purger: epoch unavailable");
+    return Status::InvalidArgument("empty epoch for file number guard");
+  }
+  std::lock_guard<std::mutex> publish_lk(publish_mutex_);
+  Status st = PutValue(0, epoch);
+  if (st.ok()) {
+    std::lock_guard<std::mutex> lk(state_mutex_);
+    sentinel_active_ = true;
+    remote_unknown_ = false;
+  } else {
+    MarkRemoteUnknown();
+  }
+  return st;
+}
+
+void FileNumberGuardPublisher::PeriodicPublish() {
+  {
+    std::lock_guard<std::mutex> lk(stop_mutex_);
+    if (stopped_) {
+      return;
+    }
+  }
+
+  uint64_t desired;
+  {
+    std::lock_guard<std::mutex> lk(state_mutex_);
+    desired = window_.SmallestFileNumber();
+    if (desired == last_published_ && !sentinel_active_ && !remote_unknown_) {
+      return;
+    }
+  }
+
+  std::string epoch = CurrentEpoch();
+  if (epoch.empty()) {
+    Log(InfoLogLevel::WARN_LEVEL, cfs_->info_log_,
+        "[fng] Skipping periodic publish: epoch unavailable");
+    return;
+  }
+
+  // try_lock: if a downward publish is in flight (possibly retrying with
+  // backoff), skip this tick instead of stalling the shared scheduler
+  // thread behind S3 latency.
+  std::unique_lock<std::mutex> publish_lk(publish_mutex_, std::try_to_lock);
+  if (!publish_lk.owns_lock()) {
+    return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(stop_mutex_);
+    if (stopped_) {
+      return;
+    }
+  }
+
+  {
+    // Staleness re-check after acquiring the publish mutex: a downward
+    // publish that landed while we waited must not be overwritten with our
+    // older, higher value.
+    std::lock_guard<std::mutex> lk(state_mutex_);
+    desired = window_.SmallestFileNumber();
+    if (desired == last_published_ && !sentinel_active_ && !remote_unknown_) {
+      return;
+    }
+  }
+
+  Status st = PutValue(desired, epoch);
+  if (st.ok()) {
+    std::lock_guard<std::mutex> lk(state_mutex_);
+    last_published_ = desired;
+    sentinel_active_ = false;
+    remote_unknown_ = false;
+  } else {
+    MarkRemoteUnknown();
+  }
+}
+
+void FileNumberGuardPublisher::MarkRemoteUnknown() {
+  std::lock_guard<std::mutex> lk(state_mutex_);
+  last_published_ = std::numeric_limits<uint64_t>::max();
+  sentinel_active_ = false;
+  remote_unknown_ = true;
+}
+
+uint64_t FileNumberGuardPublisher::TEST_LastPublished() {
+  std::lock_guard<std::mutex> lk(state_mutex_);
+  return last_published_;
+}
+
+// ---------------- FileNumberGuardListener ----------------
+
+void FileNumberGuardListener::JobBegin(uint64_t file_number, uint64_t thread_id,
+                                       int job_id) {
+  if (!publisher_) {
+    return;
+  }
+  assert(job_id >= 0);
+  publisher_->OnJobBegin(file_number, thread_id, job_id);
+}
+
+void FileNumberGuardListener::OnFlushBegin(DB *db, const FlushJobInfo &info) {
+  if (!publisher_) {
+    return;
+  }
+  uint64_t file_number = info.file_number;
+  if (file_number == 0) {
+    if (db == nullptr) {
+      return;
+    }
+    // Atomic flush notifies before allocating its output numbers, so every
+    // output from that job is greater than this conservative snapshot.
+    file_number = db->GetNextFileNumber() - 1;
+  }
+  JobBegin(file_number, info.thread_id, info.job_id);
+}
+
+void FileNumberGuardListener::OnFlushFinished(DB * /*db*/,
+                                              const FlushJobEndInfo &info) {
+  if (publisher_) {
+    publisher_->OnJobEnd(info.thread_id, info.job_id);
+  }
+}
+
+void FileNumberGuardListener::OnCompactionBegin(DB *db,
+                                                const CompactionJobInfo &info) {
+  if (db != nullptr) {
+    // Compaction output numbers are allocated after this callback.
+    JobBegin(db->GetNextFileNumber() - 1, info.thread_id, info.job_id);
+  }
+}
+
+void FileNumberGuardListener::OnCompactionCompleted(
+    DB * /*db*/, const CompactionJobInfo &info) {
+  if (publisher_) {
+    publisher_->OnJobEnd(info.thread_id, info.job_id);
+  }
+}
+
+void FileNumberGuardListener::OnExternalFileIngestionStarted(
+    DB * /*db*/, uint64_t file_number) {
+  if (publisher_) {
+    publisher_->OnJobBegin(file_number, file_number, kExternalFileJobId);
+  }
+}
+
+void FileNumberGuardListener::OnExternalFileIngestionFinished(
+    DB * /*db*/, uint64_t file_number) {
+  if (publisher_) {
+    publisher_->OnJobEnd(file_number, kExternalFileJobId);
+  }
+}
+
+void FileNumberGuardListener::OnTableFileCreationStarted(
+    const TableFileCreationBriefInfo &info) {
+  if (!publisher_ || info.reason != TableFileCreationReason::kRecovery) {
+    return;
+  }
+
+  uint64_t file_number = 0;
+  FileType file_type;
+  const bool parsed =
+      ParseFileName(basename(info.file_path), &file_number, &file_type);
+  assert(parsed && file_type == kTableFile);
+  if (!parsed || file_type != kTableFile) {
+    return;
+  }
+
+  const uint64_t thread_id = Env::Default()->GetThreadID();
+  const RecoveryKey key(info.db_name, info.cf_name, info.job_id);
+  {
+    std::lock_guard<std::mutex> lock(recovery_mutex_);
+    const bool inserted =
+        recovery_files_.emplace(key, RecoveryEntry{file_number, thread_id})
+            .second;
+    assert(inserted);
+    if (!inserted) {
+      return;
+    }
+  }
+  publisher_->OnJobBegin(file_number, file_number, kRecoveryJobId);
+}
+
+void FileNumberGuardListener::OnTableFileCreated(
+    const TableFileCreationInfo &info) {
+  if (!publisher_ || info.reason != TableFileCreationReason::kRecovery) {
+    return;
+  }
+
+  const RecoveryKey key(info.db_name, info.cf_name, info.job_id);
+  uint64_t file_number = 0;
+  {
+    std::lock_guard<std::mutex> lock(recovery_mutex_);
+    auto it = recovery_files_.find(key);
+    assert(it != recovery_files_.end());
+    if (it == recovery_files_.end()) {
+      return;
+    }
+    assert(it->second.thread_id == Env::Default()->GetThreadID());
+    file_number = it->second.file_number;
+    recovery_files_.erase(it);
+  }
+  publisher_->OnJobEnd(file_number, kRecoveryJobId);
+}
+
+// ---------------- CloudFileSystemImpl glue ----------------
+
+void CloudFileSystemImpl::SetFileNumberGuardPublisher(
+    std::shared_ptr<FileNumberGuardPublisher> publisher) {
+  std::lock_guard<std::mutex> install_lk(file_number_guard_install_mutex_);
+  auto previous = std::atomic_load(&file_number_guard_);
+  if (previous) {
+    previous->Stop();
+  }
+  std::atomic_store(&file_number_guard_, std::move(publisher));
+}
+
+Status CloudFileSystemImpl::InstallFileNumberGuardPublisher(
+    const std::shared_ptr<FileNumberGuardPublisher> &publisher) {
+  if (!publisher) {
+    return Status::InvalidArgument("null file number guard publisher");
+  }
+  std::lock_guard<std::mutex> install_lk(file_number_guard_install_mutex_);
+  auto previous = std::atomic_load(&file_number_guard_);
+  if (previous) {
+    previous->Stop();
+  }
+
+  Status status = publisher->BlockPurger();
+  if (!status.ok()) {
+    // Leave the old stopped publisher installed. Until a later successful
+    // replacement, uploads then fail closed instead of bypassing the guard.
+    return status;
+  }
+  std::atomic_store(&file_number_guard_, publisher);
+  return Status::OK();
+}
+
+bool CloudFileSystemImpl::RemoveFileNumberGuardPublisher(
+    const std::shared_ptr<FileNumberGuardPublisher> &expected) {
+  if (!expected) {
+    return false;
+  }
+  std::lock_guard<std::mutex> install_lk(file_number_guard_install_mutex_);
+  auto current = std::atomic_load(&file_number_guard_);
+  if (current != expected) {
+    return false;
+  }
+  expected->Stop();
+  std::atomic_store(&file_number_guard_,
+                    std::shared_ptr<FileNumberGuardPublisher>());
+  return true;
+}
+
+bool CloudFileSystemImpl::StopFileNumberGuardPublisher(
+    const std::shared_ptr<FileNumberGuardPublisher> &expected) {
+  if (!expected) {
+    return false;
+  }
+  std::lock_guard<std::mutex> install_lk(file_number_guard_install_mutex_);
+  if (std::atomic_load(&file_number_guard_) != expected) {
+    return false;
+  }
+  expected->Stop();
+  return true;
+}
+
+std::shared_ptr<FileNumberGuardPublisher>
+CloudFileSystemImpl::GetFileNumberGuardPublisher() const {
+  return std::atomic_load(&file_number_guard_);
+}
+
+void CloudFileSystemImpl::StopFileNumberGuard() {
+  std::lock_guard<std::mutex> install_lk(file_number_guard_install_mutex_);
+  auto publisher = std::atomic_load(&file_number_guard_);
+  if (publisher) {
+    publisher->Stop();
+    std::atomic_store(&file_number_guard_,
+                      std::shared_ptr<FileNumberGuardPublisher>());
+  }
+}
+
+Status CloudFileSystemImpl::BlockPurger() {
+  std::lock_guard<std::mutex> install_lk(file_number_guard_install_mutex_);
+  auto publisher = std::atomic_load(&file_number_guard_);
+  if (publisher) {
+    return publisher->BlockPurger();
+  }
+  // No publisher is installed: write a one-shot sentinel that remains until
+  // an external writer replaces it. The embedder owns that lifetime because
+  // there is no local scheduler to publish a finite threshold.
+  auto *manifest = GetCloudManifest();
+  if (manifest == nullptr) {
+    return Status::InvalidArgument(
+        "BlockPurger requires a loaded cloud manifest");
+  }
+  return PutSmallestFileNumberObject(this, 0, manifest->GetCurrentEpoch());
+}
+
+}  // namespace ROCKSDB_NAMESPACE

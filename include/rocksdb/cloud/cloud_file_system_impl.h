@@ -14,6 +14,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 class CloudManifest;
+class FileNumberGuardPublisher;
 class CloudScheduler;
 class CloudStorageReadableFile;
 class ObjectLibrary;
@@ -395,12 +396,36 @@ class CloudFileSystemImpl : public CloudFileSystem {
   void Purger();
   void StopPurger();
 
+  // Publisher of the smallest_new_file_number guard object (see
+  // cloud/file_number_guard.h). Set by DBCloudImpl::Open when
+  // CloudFileSystemOptions::publish_file_number_guard is enabled. Readers use
+  // atomic_load; publisher lifecycle changes are serialized below.
+  std::shared_ptr<FileNumberGuardPublisher> file_number_guard_;
+  // Serializes publisher replacement with the sentinel PUT. The old
+  // publisher remains installed but stopped until the replacement's 0
+  // sentinel is durable, so SST uploads fail closed throughout handoff.
+  std::mutex file_number_guard_install_mutex_;
+
   // Delete all local files that are invisible
   IOStatus DeleteLocalInvisibleFiles(
       const std::string& dbname,
       const std::vector<std::string>& active_cookies) override;
 
  public:
+  // File number guard (defined in cloud/file_number_guard.cc).
+  void SetFileNumberGuardPublisher(
+      std::shared_ptr<FileNumberGuardPublisher> publisher);
+  Status InstallFileNumberGuardPublisher(
+      const std::shared_ptr<FileNumberGuardPublisher> &publisher);
+  bool RemoveFileNumberGuardPublisher(
+      const std::shared_ptr<FileNumberGuardPublisher> &expected);
+  bool StopFileNumberGuardPublisher(
+      const std::shared_ptr<FileNumberGuardPublisher> &expected);
+  std::shared_ptr<FileNumberGuardPublisher> GetFileNumberGuardPublisher()
+      const;
+  void StopFileNumberGuard();
+  Status BlockPurger() override;
+
   // returns the options used to create this object
   const CloudFileSystemOptions& GetCloudFileSystemOptions() const override {
     return cloud_fs_options;

@@ -64,6 +64,12 @@ void CloudFileSystemOptions::Dump(Logger* log) const {
          create_bucket_if_missing ? "true" : "false");
   Header(log, "                         COptions.run_purger: %s",
          run_purger ? "true" : "false");
+  Header(log, "         COptions.publish_file_number_guard: %s",
+         publish_file_number_guard ? "true" : "false");
+  Header(log, "            COptions.guard_publish_interval: %llu ms",
+         static_cast<unsigned long long>(guard_publish_interval.count()));
+  Header(log, "             COptions.guard_entry_duration: %llu ms",
+         static_cast<unsigned long long>(guard_entry_duration.count()));
   Header(log, "           COptions.resync_on_open: %s",
          resync_on_open ? "true" : "false");
   Header(log, "             COptions.skip_dbid_verification: %s",
@@ -302,6 +308,31 @@ int offset_of(T1 CloudFileSystemOptions::*member) {
   return int(size_t(&(dummy_ceo_options.*member)) - size_t(&dummy_ceo_options));
 }
 
+static OptionTypeInfo MillisecondsOption(int offset) {
+  return {offset,
+          OptionType::kInt64T,
+          OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone,
+          [](const ConfigOptions& /*opts*/, const std::string& /*name*/,
+             const std::string& value, void* addr) {
+            *static_cast<std::chrono::milliseconds*>(addr) =
+                std::chrono::milliseconds(ParseInt64(value));
+            return Status::OK();
+          },
+          [](const ConfigOptions& /*opts*/, const std::string& /*name*/,
+             const void* addr, std::string* value) {
+            *value = std::to_string(
+                static_cast<const std::chrono::milliseconds*>(addr)->count());
+            return Status::OK();
+          },
+          [](const ConfigOptions& /*opts*/, const std::string& /*name*/,
+             const void* addr1, const void* addr2,
+             std::string* /*mismatch*/) {
+            return *static_cast<const std::chrono::milliseconds*>(addr1) ==
+                   *static_cast<const std::chrono::milliseconds*>(addr2);
+          }};
+}
+
 const std::unordered_map<std::string, OptionTypeInfo>
     CloudFileSystemOptions::cloud_fs_option_type_info = {
         {"keep_local_sst_files",
@@ -335,6 +366,15 @@ const std::unordered_map<std::string, OptionTypeInfo>
         {"purger_periodicity_ms",
          {offset_of(&CloudFileSystemOptions::purger_periodicity_millis),
           OptionType::kUInt64T}},
+        {"publish_file_number_guard",
+         {offset_of(&CloudFileSystemOptions::publish_file_number_guard),
+          OptionType::kBoolean}},
+        {"guard_publish_interval_ms",
+         MillisecondsOption(
+             offset_of(&CloudFileSystemOptions::guard_publish_interval))},
+        {"guard_entry_duration_ms",
+         MillisecondsOption(
+             offset_of(&CloudFileSystemOptions::guard_entry_duration))},
 
         {"provider",
          {offset_of(&CloudFileSystemOptions::storage_provider),

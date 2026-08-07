@@ -5,6 +5,7 @@
 
 #include <cinttypes>
 
+#include "cloud/file_number_guard.h"
 #include "cloud/filename.h"
 #include "file/filename.h"
 #include "rocksdb/cloud/cloud_file_system.h"
@@ -113,7 +114,6 @@ CloudStorageWritableFileImpl::CloudStorageWritableFileImpl(
   auto fname_no_epoch = RemoveEpoch(fname_);
   // Is this a manifest file?
   is_manifest_ = IsManifestFile(fname_no_epoch);
-  assert(IsSstFile(fname_no_epoch) || is_manifest_);
 
   Log(InfoLogLevel::DEBUG_LEVEL, cfs_->GetLogger(),
       "[%s] CloudWritableFile bucket %s opened local file %s "
@@ -176,7 +176,37 @@ IOStatus CloudStorageWritableFileImpl::Close(const IOOptions& opts,
   local_file_.reset();
 
   if (!is_manifest_) {
-    status_ = cfs_->CopyLocalFileToDest(fname_, cloud_fname_);
+    auto* cfs_impl = dynamic_cast<CloudFileSystemImpl*>(cfs_);
+    auto publisher =
+        cfs_impl == nullptr ? nullptr : cfs_impl->GetFileNumberGuardPublisher();
+    if (publisher && !publisher->CoversFile(fname_)) {
+      // Written outside the DB's own SST directories (a checkpoint copy, a
+      // column family export): not a DB-visible SST. No flush/compaction job
+      // registers it and the purger never evaluates it as this DB's live or
+      // obsolete file, so the guard neither protects nor blocks it.
+      Log(InfoLogLevel::DEBUG_LEVEL, cfs_->GetLogger(),
+          "[%s] CloudWritableFile %s is outside the DB directories; skipping "
+          "file number guard",
+          Name(), fname_.c_str());
+      publisher.reset();
+    }
+    uint64_t file_number = 0;
+    FileType file_type;
+    const std::string logical_name = basename(RemoveEpoch(fname_));
+    const bool parsed = ParseFileName(logical_name, &file_number, &file_type);
+    if (publisher && !parsed && IsSstFile(logical_name)) {
+      status_ = IOStatus::InvalidArgument("cannot parse SST file number",
+                                          logical_name);
+      return status_;
+    }
+    if (publisher && parsed && file_type == kTableFile) {
+      Status protection = publisher->ProtectFileUpload(file_number, [&] {
+        return cfs_->CopyLocalFileToDest(fname_, cloud_fname_);
+      });
+      status_ = status_to_io_status(std::move(protection));
+    } else {
+      status_ = cfs_->CopyLocalFileToDest(fname_, cloud_fname_);
+    }
     if (!status_.ok()) {
       Log(InfoLogLevel::ERROR_LEVEL, cfs_->GetLogger(),
           "[%s] CloudWritableFile closing PutObject failed on local file %s",
@@ -265,6 +295,26 @@ IOStatus CloudStorageWritableFileImpl::Sync(const IOOptions& opts,
 }
 
 CloudStorageProvider::~CloudStorageProvider() {}
+
+IOStatus CloudStorageProvider::DeleteCloudObjects(
+    const std::string& bucket_name,
+    const std::vector<std::string>& object_paths, size_t* deleted_count,
+    size_t* failed_count) {
+  assert(deleted_count != nullptr && failed_count != nullptr);
+  IOStatus first_error;
+  for (const auto& object_path : object_paths) {
+    auto st = DeleteCloudObject(bucket_name, object_path);
+    if (st.ok() || st.IsNotFound()) {
+      ++(*deleted_count);
+    } else {
+      ++(*failed_count);
+      if (first_error.ok()) {
+        first_error = st;
+      }
+    }
+  }
+  return first_error;
+}
 
 Status CloudStorageProvider::CreateFromString(
     const ConfigOptions& /*config_options*/, const std::string& id,

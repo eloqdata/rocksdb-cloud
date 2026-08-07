@@ -47,9 +47,13 @@ bool PrerequisitesMet(const CloudFileSystemImpl &cfs);
  */
 class S3FileNumberReader {
  public:
+  // When require_guard_marker is true, a missing marker is an error rather
+  // than a cue to fall back to the MANIFEST-derived high watermark. See
+  // ReadSmallestFileNumber.
   S3FileNumberReader(const std::string &bucket_name,
                      const std::string &s3_object_path,
-                     const std::string &epoch, CloudFileSystemImpl *cfs);
+                     const std::string &epoch, CloudFileSystemImpl *cfs,
+                     bool require_guard_marker = true);
 
   ~S3FileNumberReader() = default;
 
@@ -64,6 +68,7 @@ class S3FileNumberReader {
   std::string s3_object_path_;
   std::string epoch_;
   CloudFileSystemImpl *cfs_;
+  bool require_guard_marker_;
 
   std::string GetS3ObjectKey() const;
 };
@@ -93,16 +98,40 @@ class EloqPurger {
     PurgerFileNumberThresholds
         file_number_thresholds;  // NEW: epoch -> min file number
     std::vector<std::string> obsolete_files;
+    uint64_t s3_current_time = 0;  // S3-derived clock (ms), read once per cycle
   };
 
   EloqPurger(CloudFileSystemImpl *cfs, const std::string &bucket_name,
                  const std::string &object_path, bool dry_run,
-                 uint64_t cloudmanifest_retention_ms = 3600 * 1000);
+                 uint64_t cloudmanifest_retention_ms = 3600 * 1000,
+                 uint64_t dead_epoch_file_age_ms = 3600 * 1000,
+                 uint64_t max_deletions_per_cycle = 10000,
+                 bool require_guard_marker = true);
 
   /**
    * @brief Run a single purge cycle with improved file number checking
    */
   bool RunSinglePurgeCycle();
+
+  // In-memory selection helpers (no cloud IO). They append decisions and emit
+  // diagnostic logs; public so unit tests can exercise them directly.
+  void SelectObsoleteSSTFilesWithThreshold(
+      const PurgerAllFiles &all_files, const PurgerLiveFileSet &live_files,
+      const PurgerFileNumberThresholds &thresholds, uint64_t s3_current_time,
+      std::vector<std::string> *obsolete_files);
+  void SelectObsoleteManifestFiles(
+      const PurgerAllFiles &all_files,
+      const PurgerEpochManifestMap &current_epoch_manifest_infos,
+      uint64_t s3_current_time, std::vector<std::string> *obsolete_files);
+  Status SelectObsoleteCloudManifestFiles(
+      const PurgerAllFiles &all_files,
+      const PurgerCloudManifestMap &cloudmanifests,
+      const PurgerEpochManifestMap &current_epoch_manifest_infos,
+      uint64_t s3_current_time, std::vector<std::string> *obsolete_files);
+  void SelectObsoleteFileNumberMarkers(
+      const PurgerAllFiles &all_files,
+      const PurgerFileNumberThresholds &thresholds, uint64_t s3_current_time,
+      std::vector<std::string> *obsolete_files);
 
  private:
   CloudFileSystemImpl *cfs_;
@@ -110,6 +139,21 @@ class EloqPurger {
   std::string object_path_;
   bool dry_run_;
   uint64_t cloudmanifest_retention_ms_;
+  // Minimum object age before a non-live file in a dead epoch (an epoch that
+  // is not any loaded CLOUDMANIFEST's current epoch) may be deleted. Covers
+  // the race with a node mid-open/mid-branch-creation whose files were
+  // uploaded before our listing but whose CLOUDMANIFEST landed after it.
+  uint64_t dead_epoch_file_age_ms_;
+  // Upper bound on deletions per cycle; the remainder is re-selected next
+  // cycle. 0 means unlimited.
+  uint64_t max_deletions_per_cycle_;
+  // Every writable DBCloud that shares a purged bucket must publish a
+  // smallest_new_file_number marker for its epoch (a 0 sentinel is written
+  // before recovery can flush). With this set, a missing marker for a live
+  // epoch means the protocol is not being honored -- an unguarded or
+  // out-of-date writer -- and the cycle aborts rather than falling back to a
+  // threshold that is unsafe for an active writer.
+  bool require_guard_marker_;
 
   Status ListAllFiles(PurgerAllFiles *all_files);
   Status ListCloudManifests(std::vector<std::string> *cloud_manifest_files);
@@ -121,21 +165,9 @@ class EloqPurger {
                           PurgerEpochManifestMap *current_epoch_manifest_infos);
   Status LoadFileNumberThresholds(const PurgerCloudManifestMap &cloudmanifests,
                                   PurgerFileNumberThresholds *thresholds);
-  void SelectObsoleteSSTFilesWithThreshold(
-      const PurgerAllFiles &all_files, const PurgerLiveFileSet &live_files,
-      const PurgerFileNumberThresholds &thresholds,
-      std::vector<std::string> *obsolete_files);
-  void SelectObsoleteManifestFiles(
-      const PurgerAllFiles &all_files,
-      const PurgerEpochManifestMap &current_epoch_manifest_infos,
-      std::vector<std::string> *obsolete_files);
-  void SelectObsoleteCloudManifestFiles(
-      const PurgerAllFiles &all_files,
-      const PurgerCloudManifestMap &cloudmanifests,
-      const PurgerEpochManifestMap &current_epoch_manifest_infos,
-      std::vector<std::string> *obsolete_files);
   Status GetS3CurrentTime(uint64_t *current_time);
-  void DeleteObsoleteFiles(const std::vector<std::string> &obsolete_files);
+  Status DeleteObsoleteFiles(const std::vector<std::string> &obsolete_files,
+                             size_t *deleted, size_t *failures);
 };
 
 }  // namespace ROCKSDB_NAMESPACE

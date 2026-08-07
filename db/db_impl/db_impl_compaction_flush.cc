@@ -335,7 +335,7 @@ Status DBImpl::FlushMemTableToOutputFile(
 
   // may temporarily unlock and lock the mutex.
   NotifyOnFlushBegin(cfd, &file_meta, mutable_cf_options, job_context->job_id,
-                     flush_reason);
+                     flush_reason, flush_job.GetFileNumber());
 
   bool switched_to_mempurge = false;
   // Within flush_job.Run, rocksdb may call event listener to notify
@@ -441,6 +441,7 @@ Status DBImpl::FlushMemTableToOutputFile(
       }
     }
   }
+  NotifyOnFlushFinished(cfd, job_context->job_id, s, switched_to_mempurge);
   TEST_SYNC_POINT("DBImpl::FlushMemTableToOutputFile:Finish");
   return s;
 }
@@ -566,7 +567,7 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
     // may temporarily unlock and lock the mutex.
     FlushReason flush_reason = bg_flush_args[i].flush_reason_;
     NotifyOnFlushBegin(cfds[i], &file_meta[i], mutable_cf_options,
-                       job_context->job_id, flush_reason);
+                       job_context->job_id, flush_reason, 0 /* file_number */);
   }
 
   if (logfile_number_ > 0) {
@@ -936,12 +937,18 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
     }
   }
 
+  for (int i = 0; i != num_cfs; ++i) {
+    NotifyOnFlushFinished(cfds[i], job_context->job_id, s,
+                          switched_to_mempurge[i]);
+  }
+
   return s;
 }
 
 void DBImpl::NotifyOnFlushBegin(ColumnFamilyData* cfd, FileMetaData* file_meta,
                                 const MutableCFOptions& mutable_cf_options,
-                                int job_id, FlushReason flush_reason) {
+                                int job_id, FlushReason flush_reason,
+                                uint64_t file_number) {
   if (immutable_db_options_.listeners.size() == 0U) {
     return;
   }
@@ -963,7 +970,6 @@ void DBImpl::NotifyOnFlushBegin(ColumnFamilyData* cfd, FileMetaData* file_meta,
     info.cf_name = cfd->GetName();
     // TODO(yhchiang): make db_paths dynamic in case flush does not
     //                 go to L0 in the future.
-    const uint64_t file_number = file_meta->fd.GetNumber();
     info.file_path =
         MakeTableFileName(cfd->ioptions()->cf_paths[0].path, file_number);
     info.file_number = file_number;
@@ -1017,6 +1023,26 @@ void DBImpl::NotifyOnFlushCompleted(
   mutex_.Lock();
   // no need to signal bg_cv_ as it will be signaled at the end of the
   // flush process.
+}
+
+void DBImpl::NotifyOnFlushFinished(ColumnFamilyData *cfd, int job_id,
+                                   const Status &status,
+                                   bool switched_to_mempurge) {
+  if (immutable_db_options_.listeners.empty()) {
+    return;
+  }
+  mutex_.AssertHeld();
+  const uint32_t cf_id = cfd->GetID();
+  const std::string cf_name = cfd->GetName();
+  mutex_.Unlock();
+  {
+    FlushJobEndInfo info{cf_id,  cf_name, env_->GetThreadID(),
+                         job_id, status,  switched_to_mempurge};
+    for (const auto& listener : immutable_db_options_.listeners) {
+      listener->OnFlushFinished(this, info);
+    }
+  }
+  mutex_.Lock();
 }
 
 Status DBImpl::CompactRange(const CompactRangeOptions& options,

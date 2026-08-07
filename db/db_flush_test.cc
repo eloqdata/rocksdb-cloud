@@ -7,8 +7,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <algorithm>
 #include <atomic>
 #include <limits>
+#include <mutex>
 
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
@@ -47,6 +49,184 @@ class DBAtomicFlushTest : public DBFlushTest,
  public:
   DBAtomicFlushTest() : DBFlushTest() {}
 };
+
+TEST_F(DBFlushTest, FlushBeginReportsAllocatedFileNumber) {
+  class RecordingListener : public EventListener {
+   public:
+    void OnFlushBegin(DB* /*db*/, const FlushJobInfo& info) override {
+      ++begin_count;
+      file_number = info.file_number;
+      file_path = info.file_path;
+    }
+
+    std::atomic<int> begin_count{0};
+    uint64_t file_number = 0;
+    std::string file_path;
+  };
+
+  auto listener = std::make_shared<RecordingListener>();
+  Options options = CurrentOptions();
+  options.listeners.push_back(listener);
+  Reopen(options);
+
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+
+  ASSERT_EQ(listener->begin_count.load(), 1);
+  ASSERT_NE(listener->file_number, 0);
+  ASSERT_EQ(TableFileNameToNumber(listener->file_path), listener->file_number);
+}
+
+class RecordingFlushLifecycleListener : public EventListener {
+ public:
+  void OnFlushBegin(DB* /*db*/, const FlushJobInfo& info) override {
+    ++begin_count;
+    flush_reason = static_cast<int>(info.flush_reason);
+  }
+
+  void OnFlushCompleted(DB* /*db*/, const FlushJobInfo& /*info*/) override {
+    ++completed_count;
+  }
+
+  void OnFlushFinished(DB* /*db*/, const FlushJobEndInfo& info) override {
+    std::lock_guard<std::mutex> lock(mutex_);
+    ++finished_count;
+    finished_column_families.emplace_back(info.cf_id, info.cf_name);
+    status_ = info.status;
+    switched_to_mempurge_ = info.switched_to_mempurge;
+  }
+
+  std::vector<std::pair<uint32_t, std::string>> finished_cfs() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto result = finished_column_families;
+    std::sort(result.begin(), result.end());
+    return result;
+  }
+
+  Status status() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return status_;
+  }
+
+  bool switched_to_mempurge() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return switched_to_mempurge_;
+  }
+
+  std::atomic<int> begin_count{0};
+  std::atomic<int> completed_count{0};
+  std::atomic<int> finished_count{0};
+  std::atomic<int> flush_reason{-1};
+
+ private:
+  std::mutex mutex_;
+  std::vector<std::pair<uint32_t, std::string>> finished_column_families;
+  Status status_;
+  bool switched_to_mempurge_ = false;
+};
+
+TEST_F(DBFlushTest, FlushFinishedReportsSuccess) {
+  auto listener = std::make_shared<RecordingFlushLifecycleListener>();
+  Options options = CurrentOptions();
+  options.listeners.push_back(listener);
+  Reopen(options);
+
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+
+  ASSERT_EQ(listener->begin_count.load(), 1);
+  ASSERT_EQ(listener->completed_count.load(), 1);
+  ASSERT_EQ(listener->finished_count.load(), 1);
+  ASSERT_EQ(listener->finished_cfs(),
+            (std::vector<std::pair<uint32_t, std::string>>{{0, "default"}}));
+  ASSERT_OK(listener->status());
+  ASSERT_FALSE(listener->switched_to_mempurge());
+}
+
+TEST_F(DBFlushTest, FlushFinishedReportsFailure) {
+  auto listener = std::make_shared<RecordingFlushLifecycleListener>();
+  Options options = CurrentOptions();
+  options.listeners.push_back(listener);
+  Reopen(options);
+
+  SyncPoint::GetInstance()->SetCallBack(
+      "FlushJob::WriteLevel0Table:s", [](void* arg) {
+        *static_cast<Status*>(arg) = Status::IOError("injected flush failure");
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_NOK(Flush());
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(listener->begin_count.load(), 1);
+  ASSERT_EQ(listener->completed_count.load(), 0);
+  ASSERT_EQ(listener->finished_count.load(), 1);
+  ASSERT_NOK(listener->status());
+  ASSERT_FALSE(listener->switched_to_mempurge());
+}
+
+TEST_F(DBFlushTest, FlushFinishedReportsMempurge) {
+  auto listener = std::make_shared<RecordingFlushLifecycleListener>();
+  Options options = CurrentOptions();
+  options.atomic_flush = false;
+  options.allow_concurrent_memtable_write = true;
+  options.disable_auto_compactions = true;
+  options.inplace_update_support = false;
+  options.write_buffer_size = 1 << 20;
+  options.experimental_mempurge_threshold = 100.0;
+  options.listeners.push_back(listener);
+  Reopen(options);
+
+  std::atomic<int> mempurge_count{0};
+  SyncPoint::GetInstance()->LoadDependency(
+      {{"DBImpl::BGWorkFlush:done",
+        "DBFlushTest::FlushFinishedReportsMempurge:Done"}});
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::FlushJob:MemPurgeSuccessful",
+      [&](void* /*arg*/) { ++mempurge_count; });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  const std::string value(10 * 1024, 'v');
+  for (int i = 0; i < 60; ++i) {
+    for (int key = 0; key < 2; ++key) {
+      ASSERT_OK(Put("key" + std::to_string(key), value));
+    }
+  }
+  TEST_SYNC_POINT("DBFlushTest::FlushFinishedReportsMempurge:Done");
+
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+
+  ASSERT_EQ(listener->flush_reason.load(),
+            static_cast<int>(FlushReason::kWriteBufferFull));
+  ASSERT_GE(mempurge_count.load(), 1);
+  ASSERT_EQ(listener->begin_count.load(), listener->finished_count.load());
+  ASSERT_EQ(listener->completed_count.load(), 0);
+  ASSERT_OK(listener->status());
+  ASSERT_TRUE(listener->switched_to_mempurge());
+}
+
+TEST_F(DBFlushTest, AtomicFlushFinishesEachColumnFamily) {
+  auto listener = std::make_shared<RecordingFlushLifecycleListener>();
+  Options options = CurrentOptions();
+  options.atomic_flush = true;
+  options.listeners.push_back(listener);
+  CreateAndReopenWithCF({"pikachu"}, options);
+
+  ASSERT_OK(Put(0, "key", "value"));
+  ASSERT_OK(Put(1, "key", "value"));
+  ASSERT_OK(db_->Flush(FlushOptions(), handles_));
+
+  ASSERT_EQ(listener->begin_count.load(), 2);
+  ASSERT_EQ(listener->completed_count.load(), 2);
+  ASSERT_EQ(listener->finished_count.load(), 2);
+  ASSERT_EQ(listener->finished_cfs(),
+            (std::vector<std::pair<uint32_t, std::string>>{{0, "default"},
+                                                           {1, "pikachu"}}));
+  ASSERT_OK(listener->status());
+}
 
 // We had issue when two background threads trying to flush at the same time,
 // only one of them get committed. The test verifies the issue is fixed.

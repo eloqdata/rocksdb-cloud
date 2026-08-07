@@ -369,6 +369,27 @@ struct FlushJobInfo {
   std::vector<BlobFileAdditionInfo> blob_file_addition_infos;
 };
 
+// Information about the terminal outcome of a flush attempt. Unlike
+// FlushJobInfo, this is reported for failed flushes and successful mempurges
+// that produce no SST.
+struct FlushJobEndInfo {
+  ~FlushJobEndInfo() { status.PermitUncheckedError(); }
+
+  // The id of the column family.
+  uint32_t cf_id;
+  // The name of the column family.
+  std::string cf_name;
+  // The id of the thread that ran the flush job.
+  uint64_t thread_id;
+  // The job id, which is unique in the same thread.
+  int job_id;
+  // The final status after the flush result was installed or rolled back.
+  Status status;
+  // True when the job completed by replacing its input with a mempurged
+  // memtable instead of creating an SST.
+  bool switched_to_mempurge;
+};
+
 struct CompactionFileInfo {
   // The level of the file.
   int level;
@@ -842,6 +863,24 @@ class EventListener : public Customizable {
   virtual void OnIOError(const IOErrorInfo& /*info*/) {}
 
   ~EventListener() override {}
+
+  // Called once for each exact file number reserved for an external file
+  // ingestion or column family import, before file preparation starts.
+  virtual void OnExternalFileIngestionStarted(DB* /*db*/,
+                                              uint64_t /*file_number*/) {}
+
+  // Called once after cleanup for every file number reported to
+  // OnExternalFileIngestionStarted(), whether the operation succeeds or fails.
+  virtual void OnExternalFileIngestionFinished(DB* /*db*/,
+                                               uint64_t /*file_number*/) {}
+
+  // Called exactly once after every flush attempt whose OnFlushBegin callback
+  // was issued, after its final status is known. This includes failures and
+  // successful mempurges; OnFlushCompleted remains success-only and is not
+  // called for mempurges because they produce no SST.
+  virtual void OnFlushFinished(DB * /*db*/,
+                               const FlushJobEndInfo & /*flush_job_end_info*/) {
+  }
 };
 
 

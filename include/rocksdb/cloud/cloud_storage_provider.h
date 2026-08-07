@@ -148,5 +148,19 @@ class CloudStorageProvider : public Configurable {
       const FileOptions& options,
       std::unique_ptr<CloudStorageReadableFile>* result,
       IODebugContext* dbg) = 0;
+
+  // Delete the specified objects from the specified cloud bucket. Attempts
+  // every object even when some deletions fail; an object that does not
+  // exist counts as deleted. Adds the number of objects deleted and failed
+  // to *deleted_count and *failed_count (both must be non-null). Returns OK
+  // when every object was deleted or already absent, otherwise the first
+  // failure.
+  //
+  // The base implementation deletes serially via DeleteCloudObject.
+  // Providers with a native bulk-delete API may override it.
+  virtual IOStatus
+  DeleteCloudObjects(const std::string &bucket_name,
+                     const std::vector<std::string> &object_paths,
+                     size_t *deleted_count, size_t *failed_count);
 };
 }  // namespace ROCKSDB_NAMESPACE

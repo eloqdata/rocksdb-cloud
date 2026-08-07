@@ -76,6 +76,7 @@
 #include "file/writable_file_writer.h"
 #include "logging/logging.h"
 #include "options/cf_options.h"
+#include "rocksdb/cloud/cloud_file_system.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -809,10 +810,44 @@ Status GetDefaultCFOptions(
 }
 }  // anonymous namespace
 
+namespace {
+
+// RepairDB rebuilds SSTs through BuildTable, which uploads them through the
+// cloud writable file. Those uploads are only protected from the purger when
+// the FileNumberGuardListener is registered, and that registration happens in
+// DBCloud::Open on its own copy of the options -- a standalone RepairDB call
+// has no listener, so the publisher (if any) never learns about repair's
+// output and the files would be uploaded unprotected. Refuse instead of
+// writing files the purger may delete.
+Status CheckFileNumberGuardCompatibility(const DBOptions& db_options) {
+  if (db_options.env == nullptr) {
+    return Status::OK();
+  }
+  const auto& fs = db_options.env->GetFileSystem();
+  if (fs == nullptr) {
+    return Status::OK();
+  }
+  const auto* cfs = fs->CheckedCast<CloudFileSystem>();
+  if (cfs != nullptr &&
+      cfs->GetCloudFileSystemOptions().publish_file_number_guard) {
+    return Status::NotSupported(
+        "RepairDB is not supported when publish_file_number_guard is enabled: "
+        "repaired SST uploads would not be protected from the purger");
+  }
+  return Status::OK();
+}
+
+}  // anonymous namespace
+
 Status RepairDB(const std::string& dbname, const DBOptions& db_options,
                 const std::vector<ColumnFamilyDescriptor>& column_families) {
+  Status status = CheckFileNumberGuardCompatibility(db_options);
+  if (!status.ok()) {
+    return status;
+  }
+
   ColumnFamilyOptions default_cf_opts;
-  Status status = GetDefaultCFOptions(column_families, &default_cf_opts);
+  status = GetDefaultCFOptions(column_families, &default_cf_opts);
   if (!status.ok()) {
     return status;
   }
@@ -830,8 +865,13 @@ Status RepairDB(const std::string& dbname, const DBOptions& db_options,
 Status RepairDB(const std::string& dbname, const DBOptions& db_options,
                 const std::vector<ColumnFamilyDescriptor>& column_families,
                 const ColumnFamilyOptions& unknown_cf_opts) {
+  Status status = CheckFileNumberGuardCompatibility(db_options);
+  if (!status.ok()) {
+    return status;
+  }
+
   ColumnFamilyOptions default_cf_opts;
-  Status status = GetDefaultCFOptions(column_families, &default_cf_opts);
+  status = GetDefaultCFOptions(column_families, &default_cf_opts);
   if (!status.ok()) {
     return status;
   }
@@ -850,10 +890,15 @@ Status RepairDB(const std::string& dbname, const Options& options) {
   DBOptions db_options(opts);
   ColumnFamilyOptions cf_options(opts);
 
+  Status status = CheckFileNumberGuardCompatibility(db_options);
+  if (!status.ok()) {
+    return status;
+  }
+
   Repairer repairer(dbname, db_options, {}, cf_options /* default_cf_opts */,
                     cf_options /* unknown_cf_opts */,
                     true /* create_unknown_cfs */);
-  Status status = repairer.Run();
+  status = repairer.Run();
   if (status.ok()) {
     status = repairer.Close();
   }

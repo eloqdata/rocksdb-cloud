@@ -12,6 +12,7 @@
 #include "cache/lru_cache.h"
 #include "cloud/cloud_manifest.h"
 #include "cloud/db_cloud_impl.h"
+#include "cloud/file_number_guard.h"
 #include "cloud/filename.h"
 #include "cloud/manifest_reader.h"
 #include "env/composite_env_wrapper.h"
@@ -60,10 +61,19 @@ class ConstantSizeSstFileManager : public SstFileManagerImpl {
 };
 }  // namespace
 
-DBCloudImpl::DBCloudImpl(DB* db, std::unique_ptr<Env> local_env)
-    : DBCloud(db), cfs_(nullptr), local_env_(std::move(local_env)) {}
+DBCloudImpl::DBCloudImpl(
+    DB *db, std::unique_ptr<Env> local_env, CloudFileSystemImpl *cfs,
+    std::shared_ptr<FileNumberGuardPublisher> guard_publisher)
+    : DBCloud(db), cfs_(cfs), local_env_(std::move(local_env)),
+      guard_publisher_(std::move(guard_publisher)) {}
 
 DBCloudImpl::~DBCloudImpl() {
+  if (cfs_ != nullptr && guard_publisher_) {
+    // Keep this DB's stopped gate installed so SST Close calls during wrapped
+    // DB destruction fail instead of bypassing protection. A later Open may
+    // already own the CFS, in which case its publisher must remain untouched.
+    cfs_->StopFileNumberGuardPublisher(guard_publisher_);
+  }
   warm_up_is_running_.store(false, std::memory_order_release);
   for (auto& thd : warm_up_threads_) {
     if (thd.joinable()) {
@@ -117,6 +127,37 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
   if (!cfs->GetLogger()) {
     cfs->SetLogger(options.info_log);
   }
+
+  // Protocol enforcement for buckets whose deletion is delegated to the
+  // purger: every writable DBCloud must publish the file number guard, or the
+  // purger has no way to tell an in-flight upload from garbage. Checked here
+  // rather than in CheckValidity because a read-only open creates no SSTs and
+  // needs no guard.
+  const auto &guard_check_opts = cfs->GetCloudFileSystemOptions();
+  if (!read_only && cfs->HasDestBucket() &&
+      (guard_check_opts.disable_cloud_file_deletion ||
+       guard_check_opts.run_purger) &&
+      !guard_check_opts.publish_file_number_guard) {
+    return Status::InvalidArgument(
+        "publish_file_number_guard must be enabled for a writable DBCloud "
+        "when cloud file deletion is delegated to the purger "
+        "(disable_cloud_file_deletion or run_purger)");
+  }
+
+  // The guard's safety argument requires that a completed flush/compaction
+  // implies its MANIFEST is durable in the cloud. The MANIFEST only reaches
+  // cloud storage on Sync(), which disable_manifest_sync skips -- the guard
+  // would then rise to UINT64_MAX while the cloud MANIFEST still omits
+  // committed files, and the purger would delete them.
+  if (!read_only && cfs->HasDestBucket() &&
+      guard_check_opts.publish_file_number_guard &&
+      options.disable_manifest_sync) {
+    return Status::InvalidArgument(
+        "disable_manifest_sync is incompatible with "
+        "publish_file_number_guard: committed SSTs could be purged because "
+        "the cloud MANIFEST would not reference them");
+  }
+
   // Use a constant sized SST File Manager if necesary.
   // NOTE: if user already passes in an SST File Manager, we will respect user's
   // SST File Manager instead.
@@ -207,6 +248,46 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
   // uploaded to S3 for every update, so always enable rolling of Manifest file
   options.max_manifest_file_size = DBCloudImpl::max_manifest_file_size;
 
+  std::shared_ptr<FileNumberGuardPublisher> publisher;
+  CloudFileSystemImpl *guard_cfs = nullptr;
+  // Install a stopped-safe gate immediately before DB::Open. Recovery table
+  // creation is covered by the sentinel and listener, while the scheduler
+  // stays off until the database is fully committed in cloud storage.
+  if (!read_only && cfs->HasDestBucket() &&
+      cfs->GetCloudFileSystemOptions().publish_file_number_guard) {
+    guard_cfs = dynamic_cast<CloudFileSystemImpl *>(cfs);
+    if (guard_cfs == nullptr) {
+      return Status::InvalidArgument(
+          "publish_file_number_guard requires CloudFileSystemImpl");
+    }
+    // Every directory in which this DB may place its own SSTs. Files the
+    // cloud file system sees outside these (checkpoint copies, exports) are
+    // not DB-visible SSTs and are not gated.
+    std::vector<std::string> guard_dirs;
+    guard_dirs.push_back(local_dbname);
+    for (const auto& db_path : options.db_paths) {
+      guard_dirs.push_back(db_path.path);
+    }
+    for (const auto& cf : column_families) {
+      for (const auto& cf_path : cf.options.cf_paths) {
+        guard_dirs.push_back(cf_path.path);
+      }
+    }
+    publisher = std::make_shared<FileNumberGuardPublisher>(
+        guard_cfs, cfs->GetCloudFileSystemOptions().guard_publish_interval,
+        cfs->GetCloudFileSystemOptions().guard_entry_duration,
+        std::move(guard_dirs));
+    st = guard_cfs->InstallFileNumberGuardPublisher(publisher);
+    if (!st.ok()) {
+      Log(InfoLogLevel::ERROR_LEVEL, options.info_log,
+          "Failed to publish file number guard sentinel: %s",
+          st.ToString().c_str());
+      return st;
+    }
+    options.listeners.push_back(
+        std::make_shared<FileNumberGuardListener>(publisher));
+  }
+
   DB* db = nullptr;
   std::string dbid;
   if (read_only) {
@@ -216,13 +297,46 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
     st = DB::Open(options, local_dbname, column_families, handles, &db);
   }
 
-  if (new_db && st.ok() && cfs->HasDestBucket() &&
+  if (!st.ok()) {
+    if (publisher) {
+      publisher->Stop();
+      guard_cfs->RemoveFileNumberGuardPublisher(publisher);
+    }
+    return st;
+  }
+
+  if (new_db && cfs->HasDestBucket() &&
       cfs->GetCloudFileSystemOptions().roll_cloud_manifest_on_open) {
     // This is a new database, upload the CLOUDMANIFEST after all MANIFEST file
     // was already uploaded. It is at this point we consider the database
     // committed in the cloud.
     st = cfs->UploadCloudManifest(
         local_dbname, cfs->GetCloudFileSystemOptions().new_cookie_on_open);
+  }
+
+  if (!st.ok()) {
+    if (publisher) {
+      // Keep the stopped gate installed until the base DB has closed every
+      // writable file; only then remove this exact publisher.
+      publisher->Stop();
+    }
+    for (auto *handle : *handles) {
+      delete handle;
+    }
+    handles->clear();
+    delete db;
+    db = nullptr;
+    if (publisher) {
+      guard_cfs->RemoveFileNumberGuardPublisher(publisher);
+    }
+    return st;
+  }
+
+  if (publisher) {
+    // Best effort: the known 0 sentinel remains safe if this initial refresh
+    // fails, and the scheduler will retry unknown remote state.
+    publisher->PeriodicPublish();
+    publisher->Start();
   }
 
   // now that the database is opened, all file sizes have been verified and we
@@ -234,11 +348,11 @@ Status DBCloud::Open(const Options& opt, const std::string& local_dbname,
         false;
   }
 
-  if (st.ok()) {
-    DBCloudImpl* cloud = new DBCloudImpl(db, std::move(local_env));
-    *dbptr = cloud;
-    db->GetDbIdentity(dbid);
-  }
+  DBCloudImpl *cloud =
+      new DBCloudImpl(db, std::move(local_env),
+                      dynamic_cast<CloudFileSystemImpl *>(cfs), publisher);
+  *dbptr = cloud;
+  db->GetDbIdentity(dbid);
   Log(InfoLogLevel::INFO_LEVEL, options.info_log,
       "Opened cloud db with local dir %s dbid %s. %s", local_dbname.c_str(),
       dbid.c_str(), st.ToString().c_str());

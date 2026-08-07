@@ -109,3 +109,6 @@ third-party/folly/
 output
 
 .pre-commit-config.yaml
+
+# Purger tests read MANIFEST-<epoch> objects into the working directory
+/MANIFEST-*

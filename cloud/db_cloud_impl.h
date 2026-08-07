@@ -16,6 +16,8 @@
 namespace ROCKSDB_NAMESPACE {
 
 class Env;
+class CloudFileSystemImpl;
+class FileNumberGuardPublisher;
 
 //
 // All writes to this DB can be configured to be persisted
@@ -36,8 +38,9 @@ class DBCloudImpl : public DBCloud {
   Status GetCurrentEpoch(std::string *epoch) const override;
 
  protected:
-  // The CloudFileSystem used by this open instance.
-  CloudFileSystem* cfs_;
+  // Non-owning; the environment keeps the CloudFileSystem alive through DB
+  // teardown.
+  CloudFileSystemImpl* cfs_;
 
  private:
   Status DoCheckpointToCloud(const BucketOptions& destination,
@@ -46,9 +49,13 @@ class DBCloudImpl : public DBCloud {
   // Maximum manifest file size
   static const uint64_t max_manifest_file_size = 4 * 1024L * 1024L;
 
-  DBCloudImpl(DB* db, std::unique_ptr<Env> local_env);
+  DBCloudImpl(DB *db, std::unique_ptr<Env> local_env, CloudFileSystemImpl *cfs,
+              std::shared_ptr<FileNumberGuardPublisher> guard_publisher);
 
   std::unique_ptr<Env> local_env_;
+  // Identifies the publisher installed by this DB instance. Teardown must not
+  // stop a publisher installed by a later DBCloud::Open on the same CFS.
+  std::shared_ptr<FileNumberGuardPublisher> guard_publisher_;
 
   std::atomic<bool> warm_up_is_running_{false};
   std::vector<port::Thread> warm_up_threads_;
