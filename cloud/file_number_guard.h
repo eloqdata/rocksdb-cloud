@@ -64,8 +64,8 @@ std::string SmallestFileNumberObjectKey(const std::string &object_path,
 
 // Publish a guard value for an explicit epoch. RollNewBranch uses this before
 // making the new epoch reachable through its CLOUDMANIFEST.
-IOStatus PutSmallestFileNumberObject(CloudFileSystemImpl *cfs, uint64_t value,
-                                     const std::string &epoch);
+IOStatus PutSmallestFileNumberObject(const CloudFileSystemImpl *cfs,
+                                     uint64_t value, const std::string &epoch);
 
 // Tracks the file-number snapshots of in-flight flush/compaction jobs, keyed
 // by (thread_id, job_id). A completed job's entry lingers for entry_duration

@@ -57,7 +57,8 @@ std::string SmallestFileNumberObjectKey(const std::string &object_path,
 // CloudFileSystemImpl::BlockPurger when no publisher is registered. Callers
 // that care about PUT ordering must serialize calls themselves (the
 // publisher's publish_mutex_ does this).
-IOStatus PutSmallestFileNumberObject(CloudFileSystemImpl *cfs, uint64_t value,
+IOStatus PutSmallestFileNumberObject(const CloudFileSystemImpl *cfs,
+                                     uint64_t value,
                                      const std::string &epoch) {
   if (epoch.empty()) {
     // Publishing to "smallest_new_file_number-" (empty epoch) would create a
