@@ -515,6 +515,17 @@ Status EloqPurger::LoadFileNumberThresholds(
     const PurgerCloudManifestMap &cloudmanifests,
     PurgerFileNumberThresholds *thresholds) {
   for (const auto &entry : cloudmanifests) {
+    const std::string &cloud_manifest_name = entry.first;
+    if (cloud_manifest_name.rfind("CLOUDMANIFEST-snapshot", 0) == 0) {
+      // RollNewBranch creates an immutable snapshot epoch with no writer, so
+      // it does not publish a file-number guard. Its MANIFEST is still loaded
+      // by CollectLiveFiles and protects every SST referenced by the backup.
+      Log(InfoLogLevel::INFO_LEVEL, cfs_->info_log_,
+          "[pg] Skipping file number threshold for snapshot %s",
+          cloud_manifest_name.c_str());
+      continue;
+    }
+
     CloudManifest *manifest = entry.second.get();
     std::string epoch = manifest->GetCurrentEpoch();
 
