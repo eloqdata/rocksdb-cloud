@@ -9,6 +9,7 @@
 #include "cloud/cloud_log_controller_impl.h"
 #include "cloud/cloud_manifest.h"
 #include "cloud/cloud_scheduler.h"
+#include "cloud/file_number_guard.h"
 #include "cloud/filename.h"
 #include "cloud/manifest_reader.h"
 #include "file/file_util.h"
@@ -2142,6 +2143,10 @@ IOStatus CloudFileSystemImpl::RollNewCookie(
     // crashed in the middle, we'll endup with a CLOUDMANIFEST file pointing to
     // MANIFEST file which doesn't exist in s3
     st = UploadManifest(local_dbname, delta.epoch);
+    if (!st.ok()) {
+      return st;
+    }
+    st = PutSmallestFileNumberObject(this, delta.file_num, delta.epoch);
     if (!st.ok()) {
       return st;
     }
