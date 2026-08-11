@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "rocksdb/listener.h"
+#include "rocksdb/io_status.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -60,6 +61,11 @@ inline constexpr char kSmallestFileNumberFilePrefix[] =
 // flight".
 std::string SmallestFileNumberObjectKey(const std::string &object_path,
                                         const std::string &epoch);
+
+// Publish a guard value for an explicit epoch. RollNewBranch uses this before
+// making the new epoch reachable through its CLOUDMANIFEST.
+IOStatus PutSmallestFileNumberObject(CloudFileSystemImpl *cfs, uint64_t value,
+                                     const std::string &epoch);
 
 // Tracks the file-number snapshots of in-flight flush/compaction jobs, keyed
 // by (thread_id, job_id). A completed job's entry lingers for entry_duration
